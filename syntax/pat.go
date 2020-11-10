@@ -5,6 +5,8 @@
 package syntax
 
 import (
+	"bytes"
+	"fmt"
 	"io"
 	"strings"
 
@@ -31,6 +33,8 @@ const (
 	PatList
 	// PatStruct is a struct pattern.
 	PatStruct
+	// PatVariant is a variant pattern.
+	PatVariant
 	// PatIgnore is an ignore pattern.
 	PatIgnore
 )
@@ -51,7 +55,19 @@ type Pat struct {
 	Kind PatKind
 
 	Ident string
-	List  []*Pat
+
+	List []*Pat
+
+	// Tail is the pattern to which to bind the tail of the list (PatList).  If
+	// nil, the pattern will only match lists of exactly the same length as the
+	// pattern.
+	Tail *Pat
+
+	// Tag is the tag of the variant to match.
+	Tag string
+	// Elem is the pattern used to match the element of the variant, if it
+	// it has one.
+	Elem *Pat
 
 	Fields []PatField
 }
@@ -71,6 +87,23 @@ func (p *Pat) Equal(q *Pat) bool {
 		if !p.List[i].Equal(q.List[i]) {
 			return false
 		}
+	}
+	if (p.Tail == nil) != (q.Tail == nil) {
+		// Only exactly one of them has a tail pattern.
+		return false
+	}
+	if p.Tail != nil && q.Tail != nil && !p.Tail.Equal(q.Tail) {
+		return false
+	}
+	if p.Tag != q.Tag {
+		return false
+	}
+	if (p.Elem == nil) != (q.Elem == nil) {
+		// Only exactly one of them has an element pattern.
+		return false
+	}
+	if p.Elem != nil && !p.Elem.Equal(q.Elem) {
+		return false
 	}
 	var (
 		pfields = p.FieldMap()
@@ -116,6 +149,9 @@ func (p *Pat) Debug() string {
 		for i, q := range p.List {
 			pats[i] = q.Debug()
 		}
+		if p.Tail != nil {
+			pats = append(pats, fmt.Sprintf("...%s", p.Tail.Debug()))
+		}
 		return "list(" + strings.Join(pats, ", ") + ")"
 	case PatStruct:
 		var pats []string
@@ -123,6 +159,11 @@ func (p *Pat) Debug() string {
 			pats = append(pats, f.Name+":"+f.Pat.Debug())
 		}
 		return "struct(" + strings.Join(pats, ", ") + ")"
+	case PatVariant:
+		if p.Elem == nil {
+			return "variant(#" + p.Tag + ")"
+		}
+		return "variant(#" + p.Tag + ", " + p.Elem.Debug() + ")"
 	case PatIgnore:
 		return "ignore"
 	}
@@ -146,6 +187,9 @@ func (p *Pat) String() string {
 		for i, q := range p.List {
 			pats[i] = q.String()
 		}
+		if p.Tail != nil {
+			pats = append(pats, fmt.Sprintf("...%s", p.Tail.String()))
+		}
 		return "[" + strings.Join(pats, ", ") + "]"
 	case PatStruct:
 		var pats []string
@@ -153,6 +197,11 @@ func (p *Pat) String() string {
 			pats = append(pats, f.Name+":"+f.Pat.String())
 		}
 		return "{" + strings.Join(pats, ", ") + "}"
+	case PatVariant:
+		if p.Elem == nil {
+			return "#" + p.Tag
+		}
+		return "#" + p.Tag + "(" + p.Elem.String() + ")"
 	case PatIgnore:
 		return "_"
 	}
@@ -169,10 +218,18 @@ func (p *Pat) Idents(ids []string) []string {
 		for _, p := range p.List {
 			ids = p.Idents(ids)
 		}
+		if p.Tail != nil {
+			ids = p.Tail.Idents(ids)
+		}
 		return ids
 	case PatStruct:
 		for _, f := range p.Fields {
 			ids = f.Idents(ids)
+		}
+		return ids
+	case PatVariant:
+		if p.Elem != nil {
+			ids = p.Elem.Idents(ids)
 		}
 		return ids
 	case PatIgnore:
@@ -182,12 +239,12 @@ func (p *Pat) Idents(ids []string) []string {
 
 // BindTypes binds the pattern's identifier's types in the passed environment,
 // given the type of binding value t.
-func (p *Pat) BindTypes(env *types.Env, t *types.T) error {
+func (p *Pat) BindTypes(env *types.Env, t *types.T, use types.Use) error {
 	switch p.Kind {
 	default:
 		panic("bad pat")
 	case PatIdent:
-		env.Bind(p.Ident, t)
+		env.Bind(p.Ident, t, p.Position, use)
 		return nil
 	case PatTuple:
 		if t.Kind != types.TupleKind {
@@ -197,7 +254,7 @@ func (p *Pat) BindTypes(env *types.Env, t *types.T) error {
 			return errors.Errorf("expected tuple of size %d, got %d (%s)", want, got, t)
 		}
 		for i, q := range p.List {
-			if err := q.BindTypes(env, t.Fields[i].T); err != nil {
+			if err := q.BindTypes(env, t.Fields[i].T, use); err != nil {
 				return err
 			}
 		}
@@ -207,7 +264,12 @@ func (p *Pat) BindTypes(env *types.Env, t *types.T) error {
 			return errors.Errorf("expected list, got %s", t)
 		}
 		for _, q := range p.List {
-			if err := q.BindTypes(env, t.Elem); err != nil {
+			if err := q.BindTypes(env, t.Elem, use); err != nil {
+				return err
+			}
+		}
+		if p.Tail != nil {
+			if err := p.Tail.BindTypes(env, t, use); err != nil {
 				return err
 			}
 		}
@@ -222,11 +284,32 @@ func (p *Pat) BindTypes(env *types.Env, t *types.T) error {
 			if u == nil {
 				return errors.Errorf("struct %s does not have field %s", t, id)
 			}
-			if err := q.BindTypes(env, u); err != nil {
+			if err := q.BindTypes(env, u, use); err != nil {
 				return err
 			}
 		}
 		return nil
+	case PatVariant:
+		if t.Kind != types.SumKind {
+			return errors.Errorf("expected sum type, got %s", t)
+		}
+		vt, ok := t.VariantMap()[p.Tag]
+		if !ok {
+			return errors.Errorf("#%s is not a variant of %s", p.Tag, t)
+		}
+		switch {
+		case vt == nil && p.Elem == nil:
+			return nil
+		case vt == nil:
+			return errors.Errorf("#%s does not have an element", p.Tag)
+		case p.Elem == nil:
+			return errors.Errorf("#%s element is not matched; try `#%s _`", p.Tag, p.Tag)
+		default:
+			if err := p.Elem.BindTypes(env, vt, use); err != nil {
+				return err
+			}
+			return nil
+		}
 	case PatIgnore:
 		return nil
 	}
@@ -242,21 +325,27 @@ func (p *Pat) BindValues(env *values.Env, v values.T) bool {
 		return true
 	case PatTuple:
 		tup := v.(values.Tuple)
-		for i := range p.List {
-			if !p.BindValues(env, tup[i]) {
+		for i, q := range p.List {
+			if !q.BindValues(env, tup[i]) {
 				return false
 			}
 		}
 		return true
 	case PatList:
 		list := v.(values.List)
-		if len(list) != len(p.List) {
+		if len(list) < len(p.List) {
 			return false
 		}
-		for i := range p.List {
-			if !p.BindValues(env, list[i]) {
+		if p.Tail == nil && len(p.List) < len(list) {
+			return false
+		}
+		for i, q := range p.List {
+			if !q.BindValues(env, list[i]) {
 				return false
 			}
+		}
+		if p.Tail != nil {
+			p.Tail.BindValues(env, list[len(p.List):])
 		}
 		return true
 	case PatStruct:
@@ -267,16 +356,22 @@ func (p *Pat) BindValues(env *values.Env, v values.T) bool {
 			}
 		}
 		return true
+	case PatVariant:
+		variant := v.(*values.Variant)
+		if variant.Elem == nil {
+			return true
+		}
+		return p.Elem.BindValues(env, variant.Elem)
 	case PatIgnore:
 		return true
 	}
 }
 
-// Matchers returns a map of matchers representing this pattern.
-func (p *Pat) Matchers() map[string]*Matcher {
-	m := map[string]*Matcher{}
-	p.matchers(m, nil)
-	return m
+// Matchers returns a slice of matchers representing this pattern.
+func (p *Pat) Matchers() []*Matcher {
+	ms := []*Matcher{}
+	p.matchers(&ms, nil)
+	return ms
 }
 
 // Remove removes any identifiers in the set provided by idents and
@@ -312,6 +407,11 @@ func (p *Pat) Remove(idents interface {
 		q := new(Pat)
 		*q = *p
 		q.List = list
+		if q.Tail != nil {
+			tailPat, ids := q.Tail.Remove(idents)
+			q.Tail = tailPat
+			removed = append(removed, ids...)
+		}
 		return q, removed
 	case PatStruct:
 		var (
@@ -333,6 +433,15 @@ func (p *Pat) Remove(idents interface {
 		*q = *p
 		q.Fields = fields
 		return q, removed
+	case PatVariant:
+		if p.Elem == nil {
+			return p, nil
+		}
+		elem, removed := p.Elem.Remove(idents)
+		q := new(Pat)
+		*q = *p
+		q.Elem = elem
+		return q, removed
 	case PatIgnore:
 		return p, nil
 	}
@@ -347,25 +456,50 @@ func (p *Pat) FieldMap() map[string]*Pat {
 	return m
 }
 
-func (p *Pat) matchers(m map[string]*Matcher, parent *Matcher) {
+// Digest returns a digest for this pattern.
+func (p *Pat) Digest() digest.Digest {
+	w := reflow.Digester.NewWriter()
+	p.digest(w)
+	return w.Digest()
+}
+
+func (p *Pat) digest(w io.Writer) {
+	io.WriteString(w, "grail.com/reflow/syntax.Pat")
+	for _, m := range p.Matchers() {
+		m.Path().digest(w)
+	}
+}
+
+func (p *Pat) matchers(ms *[]*Matcher, parent *Matcher) {
 	switch p.Kind {
 	default:
 		panic("bad pat")
 	case PatIdent:
-		m[p.Ident] = &Matcher{Kind: MatchValue, Parent: parent}
+		*ms = append(*ms, &Matcher{Kind: MatchValue, Parent: parent, Ident: p.Ident})
 	case PatTuple:
 		for i, q := range p.List {
-			q.matchers(m, &Matcher{Kind: MatchTuple, Index: i, Parent: parent})
+			q.matchers(ms, &Matcher{Kind: MatchTuple, Index: i, Length: len(p.List), Parent: parent})
 		}
 	case PatList:
+		allowTail := p.Tail != nil
 		for i, q := range p.List {
-			q.matchers(m, &Matcher{Kind: MatchList, Index: i, Parent: parent})
+			q.matchers(ms, &Matcher{Kind: MatchList, Index: i, Length: len(p.List), AllowTail: allowTail, Parent: parent})
+		}
+		if p.Tail != nil {
+			p.Tail.matchers(ms, &Matcher{Kind: MatchListTail, Length: len(p.List), AllowTail: allowTail, Parent: parent})
 		}
 	case PatStruct:
 		for _, f := range p.Fields {
-			f.matchers(m, &Matcher{Kind: MatchStruct, Field: f.Name, Parent: parent})
+			f.matchers(ms, &Matcher{Kind: MatchStruct, Field: f.Name, Parent: parent})
 		}
+	case PatVariant:
+		if p.Elem == nil {
+			*ms = append(*ms, &Matcher{Kind: MatchVariant, Tag: p.Tag, Parent: parent})
+			return
+		}
+		p.Elem.matchers(ms, &Matcher{Kind: MatchVariant, Tag: p.Tag, Parent: parent})
 	case PatIgnore:
+		*ms = append(*ms, &Matcher{Kind: MatchValue, Parent: parent})
 	}
 }
 
@@ -381,8 +515,13 @@ const (
 	MatchTuple
 	// MatchList indexes a list.
 	MatchList
-	// MatchStruct indexes a struct
+	// MatchListTail indexes the tail of a list.
+	MatchListTail
+	// MatchStruct indexes a struct.
 	MatchStruct
+	// MatchVariant matches a variant or, if the variant has an element, indexes
+	// the element.
+	MatchVariant
 )
 
 // A Matcher binds individual pattern components (identifiers)
@@ -391,12 +530,24 @@ const (
 type Matcher struct {
 	// Kind is the kind of matcher.
 	Kind MatchKind
+	// Ident is the identifier to which the value of this matcher's match should
+	// be bound (MatchValue).  If Ident == "", no identifier should be bound.
+	Ident string
 	// Index is the index of the match (MatchTuple, MatchList).
 	Index int
+	// Length is the required length of the containing tuple or list
+	// (MatchTuple, MatchList).  For MatchTuple, this is already validated by
+	// the type-checker and only included here for convenience.
+	Length int
+	// AllowTail specifies whether the matcher allows the containing list to
+	// have a tail (i.e. be longer than the pattern) (MatchList).
+	AllowTail bool
 	// Parent is this matcher's parent.
 	Parent *Matcher
 	// Field holds a struct field (MatchStruct).
 	Field string
+	// Tag is the variant tag required for a match.
+	Tag string
 }
 
 // Path constructs a path from this matcher. The path may be used
@@ -414,12 +565,40 @@ func (m *Matcher) Path() Path {
 	return path
 }
 
+// String returns a string representation of matcher, mostly useful for
+// debugging.
+func (m *Matcher) String() string {
+	b := new(bytes.Buffer)
+	switch m.Kind {
+	case MatchValue:
+		b.WriteString("value")
+	case MatchTuple:
+		fmt.Fprintf(b, "tuple(%d)", m.Index)
+	case MatchList:
+		if m.AllowTail {
+			fmt.Fprintf(b, "list(%d of %d...)", m.Index, m.Length)
+		} else {
+			fmt.Fprintf(b, "list(%d of %d)", m.Index, m.Length)
+		}
+	case MatchListTail:
+		b.WriteString("list(...)")
+	case MatchStruct:
+		fmt.Fprintf(b, "struct(%s)", m.Field)
+	case MatchVariant:
+		fmt.Fprintf(b, "variant(#%s", m.Tag)
+	default:
+		panic("unknown match kind")
+	}
+	return b.String()
+}
+
 // Path represents a path to a value.
 type Path []*Matcher
 
-// Match performs single step deconstruction of a type and value.
-// It returns the next level; terminating when len(Path) == 0.
-func (p Path) Match(v values.T, t *types.T) (values.T, *types.T, bool, Path, error) {
+// Match performs single step deconstruction of a type and value. It returns the
+// next level; terminating when len(Path) == 0. If the path does not match,
+// return an error.
+func (p Path) Match(v values.T, t *types.T) (values.T, *types.T, Path, error) {
 	if len(p) == 0 {
 		panic("bad path")
 	}
@@ -428,23 +607,52 @@ func (p Path) Match(v values.T, t *types.T) (values.T, *types.T, bool, Path, err
 	default:
 		panic("bad path")
 	case MatchValue:
-		return v, t, true, p, nil
+		return v, t, p, nil
 	case MatchTuple:
-		return v.(values.Tuple)[m.Index], t.Fields[m.Index].T, true, p, nil
+		return v.(values.Tuple)[m.Index], t.Fields[m.Index].T, p, nil
 	case MatchList:
 		l := v.(values.List)
-		if m.Index >= len(l) {
-			return nil, t.Elem, false, p, errors.Errorf("cannot match index %d with a list of size %d", m.Index, len(l))
+		if len(l) < m.Length {
+			return nil, nil, nil, errors.Errorf("cannot match list pattern of size %d with a list of size %d", m.Length, len(l))
 		}
-		return l[m.Index], t.Elem, true, p, nil
+		if !m.AllowTail && m.Length < len(l) {
+			return nil, nil, nil, errors.Errorf("cannot match list pattern of size %d with a list of size %d", m.Length, len(l))
+		}
+		if len(l) <= m.Index {
+			panic("matcher index exceeds list length; should be caught by length check")
+		}
+		return l[m.Index], t.Elem, p, nil
+	case MatchListTail:
+		l := v.(values.List)
+		if len(l) < m.Length {
+			return nil, nil, nil, errors.Errorf("cannot match pattern of size %d with a list of size %d", m.Length, len(l))
+		}
+		if !m.AllowTail {
+			panic("must allow tails to match tail")
+		}
+		return l[m.Length:], t, p, nil
 	case MatchStruct:
-		return v.(values.Struct)[m.Field], t.Field(m.Field), true, p, nil
+		return v.(values.Struct)[m.Field], t.Field(m.Field), p, nil
+	case MatchVariant:
+		variant := v.(*values.Variant)
+		if variant.Tag != m.Tag {
+			return nil, nil, nil, errors.Errorf("cannot match tag #%s with a variant with tag #%s", m.Tag, variant.Tag)
+		}
+		if variant.Elem == nil {
+			return v, t, p, nil
+		}
+		return variant.Elem, t.VariantMap()[variant.Tag], p, nil
 	}
 }
 
 // Digest returns a digest representing this path.
 func (p Path) Digest() digest.Digest {
 	w := reflow.Digester.NewWriter()
+	p.digest(w)
+	return w.Digest()
+}
+
+func (p Path) digest(w io.Writer) {
 	io.WriteString(w, "grail.com/reflow/syntax.Path")
 	for _, m := range p {
 		writeN(w, int(m.Kind))
@@ -452,13 +660,23 @@ func (p Path) Digest() digest.Digest {
 		default:
 			panic("bad matcher")
 		case MatchValue:
-		case MatchTuple, MatchList:
+		case MatchTuple:
 			writeN(w, m.Index)
+			writeN(w, m.Length)
+		case MatchList:
+			writeN(w, m.Index)
+			writeN(w, m.Length)
+			if m.AllowTail {
+				w.Write([]byte{1})
+			} else {
+				w.Write([]byte{0})
+			}
+		case MatchListTail:
+			writeN(w, m.Length)
 		case MatchStruct:
 			io.WriteString(w, m.Field)
 		}
 	}
-	return w.Digest()
 }
 
 // Done tells whether this path is complete.

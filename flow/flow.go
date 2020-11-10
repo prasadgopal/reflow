@@ -8,6 +8,7 @@ package flow
 
 import (
 	"bytes"
+	"context"
 	"crypto"
 	_ "crypto/sha256"
 	"encoding/binary"
@@ -18,14 +19,14 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"time" // This is imported for the sha256 implementation, which is always required
-	// for Reflow.
+	"time" // This is imported for the sha256 implementation, which is always required for Reflow.
 
 	"github.com/grailbio/base/data"
 	"github.com/grailbio/base/digest"
 	"github.com/grailbio/base/status"
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/errors"
+	"github.com/grailbio/reflow/taskdb"
 	"github.com/grailbio/reflow/values"
 )
 
@@ -94,6 +95,8 @@ const (
 	Requirements
 	// Data evaluates to a literal (inline) piece of data.
 	Data
+	// Kctx is a flow continuation with access to the evaluator context.
+	Kctx
 
 	maxOp
 )
@@ -113,6 +116,7 @@ var opStrings = [maxOp]string{
 	Coerce:       "coerce",
 	Requirements: "requirements",
 	Data:         "data",
+	Kctx:         "kctx",
 }
 
 func (o Op) String() string {
@@ -159,7 +163,7 @@ const (
 	// NeedTransfer indicates that the evaluator should transfer all
 	// objects needed for execution into the evaluator's repository.
 	NeedTransfer
-	// Transfer indicates that the evalutor is currently
+	// Transfer indicates that the evaluator is currently
 	// transferring the flow's dependent objects from cache.
 	Transfer
 
@@ -173,8 +177,10 @@ const (
 	NeedSubmit
 
 	// Running indicates that the node is currently being evaluated by
-	// the evaluator, or has been submitted to the scheduler.
+	// the evaluator.
 	Running
+
+	Execing
 
 	// Done indicates that the node has completed evaluation.
 	Done
@@ -217,6 +223,14 @@ type ExecArg struct {
 	Index int
 }
 
+// KContext is the context provided to a continuation (Kctx).
+type KContext interface {
+	// Context is supplied context.
+	context.Context
+	// Repository returns the repository.
+	Repository() reflow.Repository
+}
+
 // Flow defines an AST for data flows. It is a logical union of ops
 // as defined by type Op. Child nodes witness computational
 // dependencies and must therefore be evaluated before its parents.
@@ -234,15 +248,17 @@ type Flow struct {
 	// Config stores this Flow's config.
 	Config Config
 
-	Image   string                           // OpExec
-	Cmd     string                           // OpExec
-	URL     *url.URL                         // OpIntern, Extern
-	Re      *regexp.Regexp                   // Groupby, Collect
-	Repl    string                           // Collect
-	MapFunc func(*Flow) *Flow                // Map, MapMerge
-	MapFlow *Flow                            // Map
-	K       func(vs []values.T) *Flow        // K
-	Coerce  func(values.T) (values.T, error) // Coerce
+	Image   string                                 // OpExec
+	Cmd     string                                 // OpExec
+	URL     *url.URL                               // OpIntern, Extern
+	Re      *regexp.Regexp                         // Groupby, Collect
+	Repl    string                                 // Collect
+	MapFunc func(*Flow) *Flow                      // Map, MapMerge
+	MapFlow *Flow                                  // Map
+	K       func(vs []values.T) *Flow              // K
+	Kctx    func(ctx KContext, v []values.T) *Flow // Kctx
+	Coerce  func(values.T) (values.T, error)       // Coerce
+
 	// ArgMap maps exec arguments to dependencies. (OpExec).
 	Argmap []ExecArg
 	// OutputIsDir tells whether the output i is a directory.
@@ -255,9 +271,13 @@ type Flow struct {
 	// and debugging.
 	Argstrs []string
 
-	// FlowDigest stores, for Val and K, a digest representing
+	// FlowDigest stores, for Val, K and Coerce, a digest representing
 	// just the operation or value.
 	FlowDigest digest.Digest
+
+	// ExtraDigest is considered as an additional digestible material of this flow
+	// and included in the the flow's logical and physical digest computation.
+	ExtraDigest digest.Digest
 
 	// A human-readable identifier for the node, for use in
 	// debugging output, etc.
@@ -286,7 +306,7 @@ type Flow struct {
 
 	// Value stores the Value to which the node was evaluated.
 	Value values.T
-	// Err stores any evaluation error that occured during flow evaluation.
+	// Err stores any evaluation error that occurred during flow evaluation.
 	Err *errors.Error
 
 	// The total runtime for evaluating this node.
@@ -298,6 +318,13 @@ type Flow struct {
 	// The exec working on this node.
 	Exec reflow.Exec
 
+	// The exec id assigned to this node which is used to submit the flow to an executor.
+	// This is different from the flow's digest, should be set only by the evaluator
+	// because it encompasses assertions of the flow's dependencies (See Eval.assignExecId).
+	// TODO(dnicolaou): Remove ExecId from scheduler mode once ExecId no longer required by scheduler
+	// tests in eval_test.go.
+	ExecId digest.Digest
+
 	// Cached stores whether the flow was retrieved from cache.
 	Cached bool
 
@@ -306,6 +333,12 @@ type Flow struct {
 
 	// Inspect stores an exec's inspect output.
 	Inspect reflow.ExecInspect
+
+	// TaskID is the identifier used to store this flow's Task representation in TaskDB.
+	// This is only used for non-scheduler mode because in scheduler mode,
+	// the corresponding task object will contain the relevant identifier.
+	// TODO(dnicolaou): Remove TaskID once nonscheduler mode is removed.
+	TaskID taskdb.TaskID
 
 	Tracked bool
 
@@ -322,13 +355,21 @@ type Flow struct {
 
 	// Dirty is used by the evaluator to track which nodes are dirtied
 	// by this node: once the node has been evaluated, these flows
-	// may be eligble for evaluation.
+	// may be eligible for evaluation.
 	Dirty []*Flow
 
 	// Pending maintains a map of this node's dependent nodes that
 	// are pending evaluation. It is maintained by the evaluator to trigger
 	// evaluation.
 	Pending map[*Flow]bool
+
+	// NonDeterministic, in the case of Execs, denotes if the exec is non-deterministic.
+	NonDeterministic bool
+
+	// ExecDepIncorrectCacheKeyBug is set for nodes that are known to be impacted by a bug
+	// which causes the cache keys to be incorrectly computed.
+	// See https://github.com/grailbio/reflow/pull/128 or T41260.
+	ExecDepIncorrectCacheKeyBug bool
 
 	digestOnce sync.Once
 	digest     digest.Digest
@@ -378,6 +419,17 @@ func (f *Flow) Requirements() (req reflow.Requirements) {
 	return f.requirements(make(map[*Flow]reflow.Requirements))
 }
 
+// ExecReset resets all flow parameters related to running
+// a single exec.
+func (f *Flow) ExecReset() {
+	// TODO(dnicolaou): Remove ExecId reset once it is no longer required
+	// for scheduler mode unit tests in eval_test.go.
+	f.ExecId = digest.Digest{}
+	f.Exec = nil
+	f.Err = nil
+	f.Inspect = reflow.ExecInspect{}
+}
+
 func (f *Flow) requirements(m map[*Flow]reflow.Requirements) (req reflow.Requirements) {
 	if r, ok := m[f]; ok {
 		return r
@@ -416,6 +468,7 @@ func (f *Flow) Fork(flow *Flow) {
 	f.Resources = flow.Resources
 	f.Value = flow.Value
 	f.K = flow.K
+	f.Kctx = flow.Kctx
 	f.Argmap = flow.Argmap
 	f.Coerce = flow.Coerce
 	f.OutputIsDir = flow.OutputIsDir
@@ -425,6 +478,9 @@ func (f *Flow) Fork(flow *Flow) {
 // Strings returns a shallow and human readable string representation of the flow.
 func (f *Flow) String() string {
 	s := fmt.Sprintf("flow %s state %s %s %s", f.Digest().Short(), f.State, f.Resources, f.Op)
+	if f.ExecDepIncorrectCacheKeyBug {
+		s += " (affected by bug T41260)"
+	}
 	switch f.Op {
 	case Exec:
 		s += fmt.Sprintf(" image %s cmd %q", f.Image, f.Cmd)
@@ -455,7 +511,7 @@ func (f *Flow) String() string {
 // for debugging.
 func (f *Flow) DebugString() string {
 	dstr := f.Digest().Short()
-	for _, d := range f.PhysicalDigests() {
+	for _, d := range f.physicalDigests() {
 		dstr += "/" + d.Short()
 	}
 	b := new(bytes.Buffer)
@@ -491,6 +547,8 @@ func (f *Flow) DebugString() string {
 		fmt.Fprintf(b, "pullup<%s>(", dstr)
 	case K:
 		fmt.Fprintf(b, "k<%s>(", dstr)
+	case Kctx:
+		fmt.Fprintf(b, "k1<%s>(", dstr)
 	case Coerce:
 		fmt.Fprintf(b, "coerce<%s>(", dstr)
 	case Requirements:
@@ -688,6 +746,16 @@ func (f *Flow) ExecArg(i int) ExecArg {
 	}
 }
 
+// setArgmap defines f.Argmap if it isn't already.
+func (f *Flow) setArgmap() {
+	if f.Argmap == nil {
+		f.Argmap = make([]ExecArg, len(f.Deps))
+		for i := range f.Deps {
+			f.Argmap[i] = ExecArg{Index: i}
+		}
+	}
+}
+
 // ExecConfig returns the flow's exec configuration. The flows dependencies
 // must already be computed before invoking ExecConfig. ExecConfig is valid
 // only for Intern, Extern, and Exec ops.
@@ -708,12 +776,7 @@ func (f *Flow) ExecConfig() reflow.ExecConfig {
 			Args:  []reflow.Arg{{Fileset: &fs}},
 		}
 	case Exec:
-		if f.Argmap == nil {
-			f.Argmap = make([]ExecArg, len(f.Deps))
-			for i := range f.Deps {
-				f.Argmap[i] = ExecArg{Index: i}
-			}
-		}
+		f.setArgmap()
 		args := make([]reflow.Arg, f.NExecArg())
 		for i := range args {
 			earg := f.ExecArg(i)
@@ -726,18 +789,60 @@ func (f *Flow) ExecConfig() reflow.ExecConfig {
 			}
 		}
 
+		image, aws, docker := ImageQualifiers(f.Image)
+		_, aws2, docker2 := ImageQualifiers(f.OriginalImage)
+		// Make a copy of all slices and maps passed to the
+		// ExecConfig. This will prevent flow properties
+		// from being unsafely modified if the ExecConfig is
+		// manually changed, like it is after resource Prediction.
+		var (
+			reserved    = make(reflow.Resources)
+			outputIsDir = make([]bool, len(f.OutputIsDir))
+		)
+		reserved.Set(f.Reserved)
+		copy(outputIsDir, f.OutputIsDir)
 		return reflow.ExecConfig{
-			Type:        "exec",
-			Ident:       f.Ident,
-			Image:       f.Image,
-			Cmd:         f.Cmd,
-			Args:        args,
-			Resources:   f.Resources,
-			OutputIsDir: f.OutputIsDir,
+			Type:             "exec",
+			Ident:            f.Ident,
+			Image:            image,
+			OriginalImage:    f.OriginalImage,
+			NeedAWSCreds:     aws || aws2,
+			NeedDockerAccess: docker || docker2,
+			Cmd:              f.Cmd,
+			Args:             args,
+			Resources:        reserved,
+			OutputIsDir:      outputIsDir,
 		}
 	default:
 		panic("no exec config for op " + f.Op.String())
 	}
+}
+
+// depAssertions returns the assertions of this flow's dependencies.
+// The flows dependencies must already be computed before invoking depAssertions.
+// depAssertions is valid only for Extern, and Exec ops.
+func (f *Flow) depAssertions() []*reflow.Assertions {
+	var depAs []*reflow.Assertions
+	switch f.Op {
+	case Extern:
+		if f.Deps[0].Value == nil {
+			break
+		}
+		depAs = f.Deps[0].Value.(reflow.Fileset).Assertions()
+	case Exec:
+		f.setArgmap()
+		for i := 0; i < f.NExecArg(); i++ {
+			earg := f.ExecArg(i)
+			if earg.Out {
+				continue
+			}
+			if f.Deps[earg.Index].Value == nil {
+				continue
+			}
+			depAs = append(depAs, f.Deps[earg.Index].Value.(reflow.Fileset).Assertions()...)
+		}
+	}
+	return depAs
 }
 
 // Digest produces a digest of Flow f. The digest captures the
@@ -832,7 +937,7 @@ func (f *Flow) WriteDigest(w io.Writer) {
 			}
 			digest.WriteDigest(w, f.FlowDigest)
 		}
-	case K, Coerce:
+	case K, Kctx, Coerce:
 		if f.FlowDigest.IsZero() {
 			panic("invalid flow digest")
 		}
@@ -840,6 +945,9 @@ func (f *Flow) WriteDigest(w io.Writer) {
 	case Pullup:
 	case Data:
 		w.Write(f.Data)
+	}
+	if !f.ExtraDigest.IsZero() {
+		digest.WriteDigest(w, f.ExtraDigest)
 	}
 }
 
@@ -856,6 +964,7 @@ func (f *Flow) physicalDigest(image string) digest.Digest {
 	case Exec:
 		io.WriteString(w, image)
 		io.WriteString(w, f.Cmd)
+		f.setArgmap()
 		for _, arg := range f.Argmap {
 			if arg.Out {
 				writeN(w, -arg.Index)
@@ -864,21 +973,24 @@ func (f *Flow) physicalDigest(image string) digest.Digest {
 			}
 		}
 	}
+	if !f.ExtraDigest.IsZero() {
+		digest.WriteDigest(w, f.ExtraDigest)
+	}
 	return w.Digest()
 }
 
-// PhysicalDigests computes the physical digests of the Flow f,
+// physicalDigests computes the physical digests of the Flow f,
 // reflecting the actual underlying operation to be performed, and
 // not the logical one. If there are multiple representations of
 // the underlying operation, then multiple digests are returned, in
 // the order of most concrete to least concrete.
 //
-// If PhysicalDigests is called on nodes whose dependencies
+// If physicalDigests is called on nodes whose dependencies
 // are not fully resolved (i.e., state Done, contains a Fileset
 // value), or on nodes not of type OpExec, or OpExtern, a nil
 // slice is returned. This is because the physical input values
 // must be available to compute the digest.
-func (f *Flow) PhysicalDigests() []digest.Digest {
+func (f *Flow) physicalDigests() []digest.Digest {
 	switch f.Op {
 	case Extern, Exec:
 	default:
@@ -908,7 +1020,7 @@ func (f *Flow) PhysicalDigests() []digest.Digest {
 // CacheKeys returns all the valid cache keys for this flow node.
 // They are returned in order from most concrete to least concrete.
 func (f *Flow) CacheKeys() []digest.Digest {
-	return append(f.PhysicalDigests(), f.Digest())
+	return append(f.physicalDigests(), f.Digest())
 }
 
 // Visitor returns a new FlowVisitor rooted at this node.
@@ -992,7 +1104,10 @@ func (v *FlowVisitor) Walk() bool {
 	}
 	return false
 }
-
+// FlowMap is a map of flows where the hash is the flow's digest unless it is an intern.
+// If an intern is set to MustIntern, then mustInternDigest is added to the hash. This
+// is done so we don't canonicalize a flow where the file has to be fully resolved to a flow
+// that can be completed only with a file reference.
 type flowMap struct {
 	sync.Mutex
 	flows map[digest.Digest]*Flow
@@ -1002,8 +1117,18 @@ func newFlowMap() *flowMap {
 	return &flowMap{flows: map[digest.Digest]*Flow{}}
 }
 
-func (m *flowMap) Get(flow *Flow) *Flow {
+var mustInternDigest = reflow.Digester.FromString("internMustInternDigest")
+
+func (m *flowMap) flowDigest(flow *Flow) digest.Digest {
 	d := flow.Digest()
+	if flow.MustIntern {
+		d.Mix(mustInternDigest)
+	}
+	return d
+}
+
+func (m *flowMap) Get(flow *Flow) *Flow {
+	d := m.flowDigest(flow)
 	m.Lock()
 	f := m.flows[d]
 	m.Unlock()
@@ -1011,7 +1136,7 @@ func (m *flowMap) Get(flow *Flow) *Flow {
 }
 
 func (m *flowMap) Put(flow *Flow) *Flow {
-	d := flow.Digest()
+	d := m.flowDigest(flow)
 	m.Lock()
 	defer m.Unlock()
 	if f := m.flows[d]; f != nil {
@@ -1045,4 +1170,34 @@ func writeN(w io.Writer, n int) {
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], uint64(n))
 	w.Write(b[:])
+}
+
+// AbbrevCmd returns the abbreviated command line for an exec flow.
+func (f *Flow) AbbrevCmd() string {
+	if f.Op != Exec {
+		return ""
+	}
+	argv := make([]interface{}, len(f.Argstrs))
+	for i := range f.Argstrs {
+		argv[i] = f.Argstrs[i]
+	}
+	cmd := fmt.Sprintf(f.Cmd, argv...)
+	// Special case: if we start with a command with an absolute path,
+	// abbreviate to basename.
+	cmd = strings.TrimSpace(cmd)
+	cmd = trimpath(cmd)
+	cmd = trimspace(cmd)
+	cmd = abbrev(cmd, nabbrev)
+	return fmt.Sprintf("%s %s", leftabbrev(f.Image, nabbrevImage), cmd)
+}
+
+// ImageQualifiers analyzes the given image for the presence of backdoor qualifiers,
+// strips the image of them, and returns a boolean for each known qualifier if present.
+func ImageQualifiers(image string) (img string, aws, docker bool) {
+	img = image
+	aws = strings.Contains(image, "$aws")
+	docker = strings.Contains(image, "$docker")
+	img = strings.ReplaceAll(img, "$aws", "")
+	img = strings.ReplaceAll(img, "$docker", "")
+	return
 }

@@ -18,12 +18,23 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/grailbio/reflow/ec2cluster/instances"
 )
 
 var (
-	url    = flag.String("url", "http://www.ec2instances.info/instances.json", "the URL from which to fetch instances.json")
-	stdout = flag.Bool("stdout", false, "print the package to stdout instead of materializing it")
+	url      = flag.String("url", "http://www.ec2instances.info/instances.json", "the URL from which to fetch instances.json")
+	stdout   = flag.Bool("stdout", false, "print the package to stdout instead of materializing it")
+	verified = flag.Bool("verified", false, "whether to generate verified.go")
 )
+
+// nitroBasedInstanceTypes contain a list of instance type classes that are nitro-based
+// (and hence expose the EBS volumes as NVMe) as per:
+// https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-types.html#ec2-nitro-instances
+// Note: www.ec2instances.info doesn't capture this correctly.
+var nitroInstanceTypePrefixes = []string{"A1", "C5", "C5a", "C5d", "C5n", "G4", "I3en", "Inf1", "M5", "M5a", "M5ad", "M5d", "M5dn", "M5n", "M6g", "p3dn.24xlarge", "R5", "R5a", "R5ad", "R5d", "R5dn", "R5n", "T3", "T3a", "z1d"}
+
+var avx512InstanceTypePrefixes = []string{"m5", "c5", "r5"}
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `usage: ec2instances dir
@@ -46,6 +57,9 @@ func main() {
 	}
 	dir := flag.Arg(0)
 
+	for i, t := range nitroInstanceTypePrefixes {
+		nitroInstanceTypePrefixes[i] = strings.ToLower(t)
+	}
 	var body io.Reader
 	if strings.HasPrefix(*url, "file://") {
 		path := strings.TrimPrefix(*url, "file://")
@@ -79,6 +93,8 @@ func main() {
 	g.Printf("	Name string\n")
 	g.Printf("	// EBSOptimized is set to true if the instance type permits EBS optimization.\n")
 	g.Printf("	EBSOptimized bool\n")
+	g.Printf("	// EBSThroughput is the max throughput for the EBS optimized instance.\n")
+	g.Printf("	EBSThroughput float64\n")
 	g.Printf("	// VCPU stores the number of VCPUs provided by this instance type.\n")
 	g.Printf("	VCPU uint\n")
 	g.Printf("	// Memory stores the number of (fractional) GiB of memory provided by this instance type.\n")
@@ -98,6 +114,7 @@ func main() {
 	g.Printf("// Types stores known EC2 instance types.\n")
 	g.Printf("var Types = []Type{\n")
 
+	var acceptedTypes []string
 	for _, e := range entries {
 		var ok bool
 		for _, arch := range e.Arch {
@@ -112,6 +129,19 @@ func main() {
 		}
 		if strings.HasSuffix(e.Type, ".metal") {
 			log.Printf("excluding bare-metal instance type %s", e.Type)
+			continue
+		}
+		if strings.Contains(e.Network, "Low") {
+			log.Printf("excluding instance type %s because its network performance can be Low", e.Type)
+			continue
+		}
+		if strings.HasPrefix(e.Type, "a1.") {
+			log.Printf("excluding instance type %s because it uses ARM (would need a different AMI)", e.Type)
+			continue
+		}
+		parts := strings.Split(e.Type, ".")
+		if strings.HasSuffix(parts[0], "gd") || strings.HasSuffix(parts[0], "g") {
+			log.Printf("excluding instance type %s because it uses AWS Graviton (would need a different AMI)", e.Type)
 			continue
 		}
 		ok = false
@@ -137,9 +167,16 @@ func main() {
 			log.Printf("excluding instance type %s because it does not support Linux HVM (supported: %s)", e.Type, strings.Join(e.LinuxVirtType, ", "))
 			continue
 		}
+		acceptedTypes = append(acceptedTypes, e.Type)
+		// All current generation instances are EBS optimized by default as per:
+		// https://aws.amazon.com/ec2/pricing/on-demand/
+		// "For Current Generation Instance types, EBS-optimization is enabled by default at no additional cost."
+		// However, http://ec2instances.info/ seems to have EBSOptimized set to false for all instances.
+		ebsOptimized := e.EBSOptimized || e.Generation == "current"
 		g.Printf("{\n")
 		g.Printf("	Name: %q,\n", e.Type)
-		g.Printf("	EBSOptimized: %v,\n", e.EBSOptimized)
+		g.Printf("	EBSOptimized: %v,\n", ebsOptimized)
+		g.Printf("	EBSThroughput: %f,\n", e.EBSThroughput)
 		g.Printf("	VCPU: %v,\n", e.VCPU)
 		g.Printf("	Memory: %f,\n", e.Memory)
 		g.Printf("	Price: map[string]float64{\n")
@@ -164,23 +201,35 @@ func main() {
 		g.Printf("	},\n")
 		g.Printf("	Generation: %q,\n", e.Generation)
 		g.Printf("	Virt: %q,\n", virt)
-		g.Printf("	NVMe: %v,\n", strings.HasPrefix(e.Type, "c5.") || strings.HasPrefix(e.Type, "m5."))
+		nvme := false
+		for _, prefix := range nitroInstanceTypePrefixes {
+			if strings.HasPrefix(e.Type, prefix) {
+				nvme = true
+				break
+			}
+		}
+		g.Printf("	NVMe: %v,\n", nvme)
 		g.Printf("	CPUFeatures: map[string]bool{\n")
 		if e.IntelAVX {
+			// TODO: This seems wrong (false negative) for many instances.
 			g.Printf("		%q: true,\n", "intel_avx")
 		}
 		if e.IntelAVX2 {
 			g.Printf("		%q: true,\n", "intel_avx2")
 		}
 		// AVX512 isn't yet exported by the data provided by AWS/ec2instances.info.
-		if strings.HasPrefix(e.Type, "c5.") || strings.HasPrefix(e.Type, "m5.") {
-			g.Printf("		%q: true,\n", "intel_avx512")
+		for _, prefix := range avx512InstanceTypePrefixes {
+			if strings.HasPrefix(e.Type, prefix) {
+				g.Printf("		%q: true,\n", "intel_avx512")
+				break
+			}
 		}
 		g.Printf("	},\n")
 		g.Printf("},\n")
 	}
 	g.Printf("}\n")
 	src := g.Gofmt()
+
 	if *stdout {
 		os.Stdout.Write(src)
 	} else {
@@ -189,14 +238,26 @@ func main() {
 		if err := ioutil.WriteFile(path, src, 0644); err != nil {
 			log.Fatal(err)
 		}
+		if *verified {
+			vgen := instances.VerifiedSrcGenerator{filepath.Base(dir), instances.VerifiedByRegion}
+			vsrc, err := vgen.AddTypes(acceptedTypes).Source()
+			if err != nil {
+				log.Fatal(err)
+			}
+			vpath := filepath.Join(dir, "verified.go")
+			if err := ioutil.WriteFile(vpath, vsrc, 0644); err != nil {
+				log.Fatal(err)
+			}
+		}
 	}
 }
 
 type entry struct {
-	Arch         []string `json:"arch"`
-	Type         string   `json:"instance_type"`
-	EBSOptimized bool     `json:"ebs_optimized"`
-	Memory       float64  `json:"memory"`
+	Arch          []string `json:"arch"`
+	Type          string   `json:"instance_type"`
+	EBSOptimized  bool     `json:"ebs_optimized"`
+	EBSThroughput float64  `json:"ebs_throughput"`
+	Memory        float64  `json:"memory"`
 	// VCPU must be an abstract, because "N/A" is returned
 	// for the "i3.metal" instance type.
 	VCPU          interface{}                       `json:"vCPU"`

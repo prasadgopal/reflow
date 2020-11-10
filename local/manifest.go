@@ -7,7 +7,7 @@ package local
 import (
 	"time"
 
-	"github.com/docker/docker/api/types"
+	"docker.io/go-docker/api/types"
 	"github.com/grailbio/reflow"
 )
 
@@ -26,6 +26,7 @@ const (
 type Manifest struct {
 	Type  execType
 	State execState
+	PID   int
 
 	Created time.Time
 

@@ -17,9 +17,11 @@ import (
 )
 
 // File represents a File inside of Reflow. A file is said to be
-// resolved if it contains the digest of the file's contents.
+// resolved if it contains the digest of the file's contents (ID).
 // Otherwise, a File is said to be a reference, in which case it must
-// contain a source and etag.
+// contain a source and etag and may contain a ContentHash.
+// Any type of File (resolved or reference) can contain Assertions.
+// TODO(swami): Split into resolved/reference files explicitly.
 type File struct {
 	// The digest of the contents of the file.
 	ID digest.Digest
@@ -35,15 +37,33 @@ type File struct {
 	ETag string `json:",omitempty"`
 
 	// LastModified stores the file's last modified time.
-	LastModified time.Time
+	LastModified time.Time `json:",omitempty"`
+
+	// ContentHash is the digest of the file contents and can be present
+	// for unresolved (ie reference) files.
+	// ContentHash is expected to equal ID once this file is resolved.
+	ContentHash digest.Digest `json:",omitempty"`
+
+	// Assertions are the set of assertions representing the state
+	// of all the dependencies that went into producing this file.
+	// Unlike Etag/Size etc which are properties of this File,
+	// Assertions can include properties of other subjects that
+	// contributed to producing this File.
+	Assertions *Assertions `json:",omitempty"`
 }
 
-// Digest returns the file's digest: if the file is a reference, the
-// digest comprises the reference, source, and etag. Resolved files
-// return the file's digest.
+// Digest returns the file's digest: if the file is a reference and
+// it's ContentHash is unset, the digest comprises the
+// reference, source, etag and assertions.
+// Reference files will return ContentHash if set
+// (which is assumed to be the digest of the file's contents).
+// Resolved files return ID which is the digest of the file's contents.
 func (f File) Digest() digest.Digest {
 	if !f.IsRef() {
 		return f.ID
+	}
+	if !f.ContentHash.IsZero() {
+		return f.ContentHash
 	}
 	w := Digester.NewWriter()
 	var b [8]byte
@@ -51,14 +71,24 @@ func (f File) Digest() digest.Digest {
 	w.Write(b[:])
 	io.WriteString(w, f.Source)
 	io.WriteString(w, f.ETag)
+	f.Assertions.WriteDigest(w)
 	return w.Digest()
 }
 
 // Equal returns whether files f and g represent the same content.
+// Since equality is a property of the file's contents, assertions are ignored.
 func (f File) Equal(g File) bool {
+	if f.IsRef() != g.IsRef() {
+		panic(fmt.Sprintf("cannot compare unresolved and resolved file: f(%v), g(%v)", f, g))
+	}
 	if f.IsRef() || g.IsRef() {
 		// When we compare references, we require nonempty etags.
-		return f.Size == g.Size && f.Source == g.Source && f.ETag != "" && f.ETag == g.ETag
+		equal := f.Size == g.Size && f.Source == g.Source && f.ETag != "" && f.ETag == g.ETag
+		// We require equal ContentHash if present in both
+		if !f.ContentHash.IsZero() && !g.ContentHash.IsZero() && f.ContentHash.Name() == g.ContentHash.Name() {
+			return equal && f.ContentHash == g.ContentHash
+		}
+		return equal
 	}
 	return f.ID == g.ID
 }
@@ -81,7 +111,15 @@ func (f File) String() string {
 	}
 	if f.ETag != "" {
 		maybeComma(&b)
-		fmt.Fprintf(&b, "etag: %vs", f.ETag)
+		fmt.Fprintf(&b, "etag: %v", f.ETag)
+	}
+	if !f.ContentHash.IsZero() {
+		maybeComma(&b)
+		fmt.Fprintf(&b, "contenthash: %v", f.ContentHash.Short())
+	}
+	if !f.Assertions.IsEmpty() {
+		maybeComma(&b)
+		fmt.Fprintf(&b, "assertions: <%s>", f.Assertions.Short())
 	}
 	return b.String()
 }
@@ -95,7 +133,7 @@ func (f File) Short() string {
 }
 
 // Fileset is the result of an evaluated flow. Values may either be
-// lists of values or Filesets. Filesets are a map of paths to Files.
+// lists of values or Filesets.  Filesets are a map of paths to Files.
 type Fileset struct {
 	List []Fileset       `json:",omitempty"`
 	Map  map[string]File `json:"Fileset,omitempty"`
@@ -116,7 +154,7 @@ func (v Fileset) Equal(w Fileset) bool {
 	}
 	for key, f := range v.Map {
 		g, ok := w.Map[key]
-		if !ok || !f.Equal(g) {
+		if !ok || f.IsRef() != g.IsRef() || !f.Equal(g) {
 			return false
 		}
 	}
@@ -145,6 +183,38 @@ func (v Fileset) AnyEmpty() bool {
 	return len(v.List) == 0 && len(v.Map) == 0
 }
 
+// Assertions returns a list of all Assertions across all the Files in this Fileset
+func (v Fileset) Assertions() []*Assertions {
+	files := v.Files()
+	fas := make([]*Assertions, len(files))
+	for i, f := range files {
+		fas[i] = f.Assertions
+	}
+	return fas
+}
+
+// AddAssertions adds the given assertions to all files in this Fileset.
+func (v *Fileset) AddAssertions(as ...*Assertions) error {
+	as, size := NonEmptyAssertions(as...)
+	if size == 0 {
+		return nil
+	}
+	for _, fs := range v.List {
+		return fs.AddAssertions(as...)
+	}
+	for k := range v.Map {
+		f := v.Map[k]
+		if f.Assertions == nil {
+			f.Assertions = NewAssertions()
+		}
+		if err := f.Assertions.AddFrom(as...); err != nil {
+			return err
+		}
+		v.Map[k] = f
+	}
+	return nil
+}
+
 // Flatten is a convenience function to flatten (shallowly) the value
 // v, returning a list of Values. If the value is a list value, the
 // list is returned; otherwise a unary list of the value v is
@@ -160,11 +230,11 @@ func (v Fileset) Flatten() []Fileset {
 
 // Files returns the set of Files that comprise the value.
 func (v Fileset) Files() []File {
-	fs := map[File]bool{}
+	fs := map[digest.Digest]File{}
 	v.files(fs)
 	files := make([]File, len(fs))
 	i := 0
-	for f := range fs {
+	for _, f := range fs {
 		files[i] = f
 		i++
 	}
@@ -193,10 +263,10 @@ func (v Fileset) Size() int64 {
 	return s
 }
 
-// Subst fileset v with references files substituted using the
-// provided map. Subst returns whether the fileset is fully resolved
-// after substitution.
-func (v Fileset) Subst(sub map[File]File) (out Fileset, resolved bool) {
+// Subst the files in fileset using the provided mapping of File object digests to Files.
+// Subst returns whether the fileset is fully resolved after substitution.
+// That is, any unresolved file f in this fileset tree, will be substituted by sub[f.Digest()].
+func (v Fileset) Subst(sub map[digest.Digest]File) (out Fileset, resolved bool) {
 	resolved = true
 	if v.List != nil {
 		out.List = make([]Fileset, len(v.List))
@@ -211,7 +281,7 @@ func (v Fileset) Subst(sub map[File]File) (out Fileset, resolved bool) {
 	if v.Map != nil {
 		out.Map = make(map[string]File, len(v.Map))
 		for path, file := range v.Map {
-			if f, ok := sub[file]; ok {
+			if f, ok := sub[file.Digest()]; ok {
 				out.Map[path] = f
 			} else {
 				out.Map[path] = file
@@ -224,13 +294,13 @@ func (v Fileset) Subst(sub map[File]File) (out Fileset, resolved bool) {
 	return
 }
 
-func (v Fileset) files(fs map[File]bool) {
+func (v Fileset) files(fs map[digest.Digest]File) {
 	for i := range v.List {
 		v.List[i].files(fs)
 	}
 	if v.Map != nil {
 		for _, f := range v.Map {
-			fs[f] = true
+			fs[f.Digest()] = f
 		}
 	}
 }
@@ -360,6 +430,67 @@ func (v Fileset) pullup(m map[string]File) {
 	for _, v := range v.List {
 		v.pullup(m)
 	}
+}
+
+// Diff deep-compares the values two filesets assuming they have the same structure
+// and returns a pretty-diff of the differences (if any) and a boolean if they are different.
+func (v Fileset) Diff(w Fileset) (string, bool) {
+	return diffdepth(v, w, "", 0)
+}
+
+func diffdepth(a, b Fileset, prefix string, depth int) (string, bool) {
+	var diffs []string
+	set := make(map[string]struct{})
+	for k := range a.Map {
+		set[k] = struct{}{}
+	}
+	for k := range b.Map {
+		set[k] = struct{}{}
+	}
+	list := make([]string, len(set))
+	i := 0
+	for k := range set {
+		list[i] = k
+		i++
+	}
+	sort.Strings(list)
+	prefix = strings.Repeat("  ", depth) + prefix
+	for _, k := range list {
+		av, aok := a.Map[k]
+		bv, bok := b.Map[k]
+		switch {
+		case aok && bok && av.Digest() != bv.Digest():
+			diffs = append(diffs, fmt.Sprintf("%s\"%s\" = %s -> %s", prefix, k, av.Short(), bv.Short()))
+		case aok && !bok:
+			diffs = append(diffs, fmt.Sprintf("%s\"%s\" = %s -> %s", prefix, k, av.Short(), "void"))
+		case !aok && bok:
+			diffs = append(diffs, fmt.Sprintf("%s\"%s\" = %s -> %s", prefix, k, "void", bv.Short()))
+		}
+	}
+	n := len(a.List)
+	if n < len(b.List) {
+		n = len(b.List)
+	}
+	for i := 0; i < n; i++ {
+		var fsa, fsb Fileset
+		if i < len(a.List) {
+			fsa = a.List[i]
+		}
+		if i < len(b.List) {
+			fsb = b.List[i]
+		}
+		switch {
+		case fsa.Empty() && !fsb.Empty():
+			diffs = append(diffs, fmt.Sprintf("[%d]:empty -> %s", i, fsb.Short()))
+		case !fsa.Empty() && fsb.Empty():
+			diffs = append(diffs, fmt.Sprintf("[%d]:%s -> empty", i, fsa.Short()))
+		case !fsa.Empty() && !fsb.Empty():
+			if d, ok := diffdepth(fsa, fsb, fmt.Sprintf("[%d]:", i), depth+1); ok {
+				diffs = append(diffs, d)
+			}
+		}
+	}
+	return strings.Join(diffs, "\n"), len(diffs) > 0
 }
 
 func maybeComma(b *strings.Builder) {

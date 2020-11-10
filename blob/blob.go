@@ -22,7 +22,7 @@ type Store interface {
 	Bucket(ctx context.Context, name string) (Bucket, error)
 }
 
-// A Bucket is a single namespace of keys from which files can be
+// A Bucket is a single Namespace of keys from which files can be
 // retrieved. Buckets support efficient prefix scans as well as both
 // streaming and "direct" (concurrent) downloads.
 type Bucket interface {
@@ -38,7 +38,9 @@ type Bucket interface {
 	// writing to arbitrary offsets in the writer, potentially leaving
 	// holes on error on incomplete downloads. If the provided ETag is
 	// nonempty, then it is taken as a precondition for fetching.
-	Download(ctx context.Context, key, etag string, w io.WriterAt) (int64, error)
+	// If the provided size is non-zero, it is used as a hint to manage
+	// concurrency.
+	Download(ctx context.Context, key, etag string, size int64, w io.WriterAt) (int64, error)
 
 	// Get returns a (streaming) reader for the contents at the provided
 	// key. The returned reflow.File represents the known metadata of
@@ -48,7 +50,11 @@ type Bucket interface {
 
 	// Put streams the provided body to the provided key. Put overwrites
 	// any existing object at the same key.
-	Put(ctx context.Context, key string, body io.Reader) error
+	// If the provided size is non-zero, it is used as a hint to manage
+	// concurrency.
+	// If a non-empty contentHash is provided, it is stored in the object's metadata.
+	// TODO(swami): Remove ContentHash and pass Headers/Metadata instead.
+	Put(ctx context.Context, key string, size int64, body io.Reader, contentHash string) error
 
 	// Snapshot returns an un-loaded Reflow fileset representing the
 	// contents of the provided prefix. This may then later be used to
@@ -56,7 +62,12 @@ type Bucket interface {
 	Snapshot(ctx context.Context, prefix string) (reflow.Fileset, error)
 
 	// Copy copies key src to key dst in this bucket.
-	Copy(ctx context.Context, src, dst string) error
+	// A non-empty contentHash will be added to dst's metadata only if not already set in src.
+	// TODO(swami): Remove ContentHash and pass Headers/Metadata instead.
+	Copy(ctx context.Context, src, dst, contentHash string) error
+
+	// CopyFrom copies from bucket src and key srcKey into this bucket.
+	CopyFrom(ctx context.Context, srcBucket Bucket, src, dst string) error
 
 	// Delete removes the provided keys.
 	Delete(ctx context.Context, keys ...string) error

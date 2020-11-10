@@ -21,14 +21,23 @@
 package sched
 
 import (
+	"bytes"
 	"container/heap"
 	"context"
+	"fmt"
+	"sort"
+	"strings"
+	"sync"
 	"time"
 
+	"github.com/grailbio/base/data"
+	"github.com/grailbio/base/digest"
 	"github.com/grailbio/reflow"
-
+	"github.com/grailbio/reflow/blob"
+	"github.com/grailbio/reflow/errors"
 	"github.com/grailbio/reflow/log"
 	"github.com/grailbio/reflow/pool"
+	"github.com/grailbio/reflow/taskdb"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -42,6 +51,11 @@ type Cluster interface {
 	Allocate(ctx context.Context, req reflow.Requirements, labels pool.Labels) (pool.Alloc, error)
 }
 
+// blobLocator defines an interface for locating blobs.
+type blobLocator interface {
+	Location(ctx context.Context, id digest.Digest) (string, error)
+}
+
 // A Scheduler is responsible for managing a set of tasks and allocs,
 // assigning (and reassigning) tasks to appropriate allocs. Scheduler
 // can manage large numbers of tasks and allocs efficiently.
@@ -49,6 +63,8 @@ type Scheduler struct {
 	// Transferer is used to manage data movement between
 	// allocs and the scheduler's repository.
 	Transferer reflow.Transferer
+	// Mux is used to manage direct data transfers between blob stores (if supported)
+	Mux blob.Mux
 	// Repository is the repository from which dependent objects are
 	// downloaded and to which result objects are uploaded.
 	Repository reflow.Repository
@@ -56,6 +72,8 @@ type Scheduler struct {
 	Cluster Cluster
 	// Log logs scheduler actions.
 	Log *log.Logger
+	// TaskDB is  the task reporting db.
+	TaskDB taskdb.TaskDB
 
 	// MaxPendingAllocs is the maximum number outstanding
 	// alloc requests.
@@ -68,8 +86,14 @@ type Scheduler struct {
 	// the scheduler.
 	MinAlloc reflow.Resources
 
+	// PostUseChecksum indicates whether input filesets are checksummed after use.
+	PostUseChecksum bool
+
 	// Labels is the set of labels applied to newly created allocs.
 	Labels pool.Labels
+
+	// Stats is the scheduler stats.
+	Stats *Stats
 
 	submitc chan []*Task
 }
@@ -81,7 +105,8 @@ func New() *Scheduler {
 		submitc:          make(chan []*Task),
 		MaxPendingAllocs: 5,
 		MaxAllocIdleTime: 5 * time.Minute,
-		MinAlloc:         reflow.Resources{"cpu": 1, "mem": 1 << 30, "disk": 10 << 30},
+		MinAlloc:         reflow.Resources{"cpu": 1, "mem": 1 << 30, "disk": 1 << 30},
+		Stats:            newStats(),
 	}
 }
 
@@ -90,9 +115,38 @@ func New() *Scheduler {
 // manages a task until it reaches the TaskDone state.
 func (s *Scheduler) Submit(tasks ...*Task) {
 	for _, task := range tasks {
-		task.Log.Debugf("scheduler: task submitted with %v", task.Config)
+		task.Log.Debugf("submitted with %v", task.Config)
 	}
-	s.submitc <- tasks
+	tasksCopy := append([]*Task{}, tasks...)
+	s.submitc <- tasksCopy
+}
+
+// ExportStats exports scheduler stats as expvars.
+func (s *Scheduler) ExportStats() {
+	s.Stats.Publish()
+}
+
+func (s *Scheduler) configString() string {
+	var b bytes.Buffer
+	if s.Transferer != nil {
+		_, _ = fmt.Fprintf(&b, "transferer %T", s.Transferer)
+	}
+	if s.Repository != nil {
+		_, _ = fmt.Fprintf(&b, " repository %T", s.Repository)
+	}
+	if s.Cluster != nil {
+		_, _ = fmt.Fprintf(&b, " cluster %T", s.Cluster)
+	}
+	if s.TaskDB != nil {
+		_, _ = fmt.Fprintf(&b, " taskDB %T", s.TaskDB)
+	}
+	var schemes []string
+	for s := range s.Mux {
+		schemes = append(schemes, s)
+	}
+	sort.Strings(schemes)
+	_, _ = fmt.Fprintf(&b, " blob.Mux[%s]", strings.Join(schemes, ", "))
+	return b.String()
 }
 
 // Do commences scheduling. The scheduler runs until the provided
@@ -130,6 +184,7 @@ func (s *Scheduler) Do(ctx context.Context) error {
 	)
 	defer tick.Stop()
 
+	s.Log.Debugf("starting with configuration: %s", s.configString())
 	for {
 		select {
 		case <-ctx.Done():
@@ -167,7 +222,12 @@ func (s *Scheduler) Do(ctx context.Context) error {
 				}
 			}
 		case tasks := <-s.submitc:
+			s.Stats.AddTasks(tasks)
 			for _, task := range tasks {
+				if task.Config.Type == "extern" && !task.nonDirectTransfer {
+					go s.directTransfer(ctx, task)
+					continue
+				}
 				heap.Push(&todo, task)
 			}
 		case task := <-returnc:
@@ -186,20 +246,33 @@ func (s *Scheduler) Do(ctx context.Context) error {
 			case TaskDone:
 				// In this case we're done, and we can forget about the task.
 			}
+			s.Stats.ReturnTask(task, alloc)
+			// Network errors imply that the alloc is unreachable.
+			// Context cancelled errors indicate that the alloc's context is done and therefore unusable.
+			// While in both these cases, the alloc's keepalive mechanism will eventually mark it as dead,
+			// we do it early here to immediately avoid scheduling tasks on it.
+			if (errors.Is(errors.Canceled, task.Err) || errors.Is(errors.Net, task.Err)) && alloc.index != -1 {
+				heap.Remove(&live, alloc.index)
+				alloc.index = -1
+			}
 		case alloc := <-notifyc:
 			heap.Remove(&pending, alloc.index)
 			if alloc.Alloc != nil {
 				alloc.Init()
 				heap.Push(&live, alloc)
+				s.Stats.AddAlloc(alloc)
 			}
 		case alloc := <-deadc:
 			// The allocs tasks will be returned with state TaskLost.
-			heap.Remove(&live, alloc.index)
+			if alloc.index != -1 {
+				heap.Remove(&live, alloc.index)
+			}
+			s.Stats.MarkAllocDead(alloc)
 		}
 
-		assigned := s.assign(&todo, &live)
+		assigned := s.assign(&todo, &live, s.Stats)
 		for _, task := range assigned {
-			task.Log.Debugf("scheduler: assigning task to alloc %v", task.alloc)
+			task.Log.Debugf("assigning to alloc %v", task.alloc)
 			nrunning++
 			go s.run(task, returnc)
 		}
@@ -212,14 +285,24 @@ func (s *Scheduler) Do(ctx context.Context) error {
 		}
 
 		// We have more to do, and potential to allocate. We mock allocate remaining
-		// tasks to pending allocs, and then allocate any remaining.
-		assigned = s.assign(&todo, &pending)
-		req := requirements(todo)
+		// tasks to pending allocs, and then allocate any remaining (if any).
+		assigned = s.assign(&todo, &pending, nil)
+		var (
+			req reflow.Requirements
+			// needMore tells whether any tasks remain after mock allocation.
+			// This is needed in addition to `req` because if all tasks have empty resources
+			// we end up getting empty requirements, but we should trigger at least one allocation.
+			needMore bool
+		)
+		if len(todo) > 0 {
+			req = requirements(todo)
+			needMore = true
+		}
 		for _, task := range assigned {
 			task.alloc.Unassign(task)
 			heap.Push(&todo, task)
 		}
-		if req.Equal(reflow.Requirements{}) {
+		if req.Equal(reflow.Requirements{}) && !needMore {
 			continue
 		}
 
@@ -227,16 +310,12 @@ func (s *Scheduler) Do(ctx context.Context) error {
 		alloc := newAlloc()
 		alloc.Requirements = req
 		alloc.Available = req.Min
-		if req.Width > 1 {
-			alloc.Available = nil
-			alloc.Available.Scale(alloc.Available, float64(req.Width))
-		}
 		heap.Push(&pending, alloc)
 		go s.allocate(ctx, alloc, notifyc, deadc)
 	}
 }
 
-func (s *Scheduler) assign(tasks *taskq, allocs *allocq) (assigned []*Task) {
+func (s *Scheduler) assign(tasks *taskq, allocs *allocq, stats *Stats) (assigned []*Task) {
 	var unassigned []*alloc
 	for len(*tasks) > 0 && len(*allocs) > 0 {
 		var (
@@ -252,6 +331,9 @@ func (s *Scheduler) assign(tasks *taskq, allocs *allocq) (assigned []*Task) {
 		}
 		heap.Pop(tasks)
 		alloc.Assign(task)
+		if stats != nil {
+			stats.AssignTask(task, alloc)
+		}
 		assigned = append(assigned, task)
 		heap.Fix(allocs, 0)
 	}
@@ -272,7 +354,7 @@ func (s *Scheduler) allocate(ctx context.Context, alloc *alloc, notify, dead cha
 	}
 	alloc.Context, alloc.Cancel = context.WithCancel(ctx)
 	notify <- alloc
-	err = pool.Keepalive(alloc.Context, nil, alloc.Alloc)
+	err = pool.Keepalive(alloc.Context, s.Log, alloc.Alloc)
 	alloc.Cancel()
 	if err != nil && err == ctx.Err() {
 		var cancel func()
@@ -281,7 +363,7 @@ func (s *Scheduler) allocate(ctx context.Context, alloc *alloc, notify, dead cha
 		cancel()
 	}
 	if err != nil {
-		s.Log.Errorf("alloc keepalive failed: %v", err)
+		s.Log.Errorf("alloc %s keepalive failed: %v", alloc.id, err)
 	}
 	dead <- alloc
 }
@@ -290,13 +372,14 @@ type execState int
 
 const (
 	stateLoad execState = iota
-	stateTransferIn
 	statePut
 	stateWait
+	stateVerify
 	statePromote
 	stateInspect
 	stateResult
 	stateTransferOut
+	stateUnload
 	stateDone
 )
 
@@ -306,12 +389,12 @@ func (e execState) String() string {
 		panic("bad state")
 	case stateLoad:
 		return "loading"
-	case stateTransferIn:
-		return "transferring input"
 	case statePut:
 		return "submitting"
 	case stateWait:
 		return "waiting for completion"
+	case stateVerify:
+		return "verifying integrity"
 	case statePromote:
 		return "promoting objects"
 	case stateInspect:
@@ -320,66 +403,141 @@ func (e execState) String() string {
 		return "retrieving result"
 	case stateTransferOut:
 		return "transferring output"
+	case stateUnload:
+		return "unloading"
 	case stateDone:
 		return "complete"
 	}
 }
 
+// next returns the next state considering the `err` encountered after completing this state.
+// It also returns a message (suitable for logging) explaining why the next state was chosen.
+func (e execState) next(ctx context.Context, err error, postUseChecksum bool) (next execState, msg string) {
+	switch {
+	case ctx.Err() != nil:
+		msg = fmt.Sprintf("ctx.Err(): %v", ctx.Err())
+		next = stateDone
+	case err == nil:
+		msg = "successful"
+		next = e + 1
+	case errors.NonRetryable(err):
+		msg = fmt.Sprintf("non-retryable error: %v", err)
+		next = stateDone
+	default:
+		msg = fmt.Sprintf("retryable error: %v", err)
+		next = e
+	}
+	// Skip stateVerify unless post-use checksumming is enabled
+	if next == stateVerify && !postUseChecksum {
+		next++
+	}
+	return
+}
+
 func (s *Scheduler) run(task *Task, returnc chan<- *Task) {
 	var (
-		err   error
-		alloc = task.alloc
-		ctx   = alloc.Context
-		x     reflow.Exec
-		n     = 0
-		state execState
+		err            error
+		alloc          = task.alloc
+		ctx            = alloc.Context
+		x              reflow.Exec
+		n              = 0
+		state          execState
+		tcancel        context.CancelFunc
+		tctx           context.Context
+		loadedData     sync.Map
+		resultUnloaded bool
 	)
-	// TODO(marius): we should distinguish between fatal and nonfatal errors.
-	// The fatal ones are useless to retry.
+	defer func() {
+		if tcancel == nil {
+			return
+		}
+		// Use background context for setting task completion status.
+		if taskdbErr := s.TaskDB.SetTaskComplete(context.Background(), task.ID, err, time.Now()); taskdbErr != nil {
+			task.Log.Errorf("taskdb settaskcomplete: %v", taskdbErr)
+		}
+		tcancel()
+	}()
+	// Save the original fileset. In cases, where we fail, we need to restore the original fileset,
+	// since after the load all the interned files are technically resolved w.r.t. the current alloc.
+	// If we get reassigned to a new alloc, that will not be true anymore, and hence we need to resolve
+	// the files all over again.
+	savedArgs := append([]reflow.Arg{}, task.Config.Args...)
 	for n < numExecTries && state < stateDone {
+		task.Log.Debugf("%s (try %d): started", state, n)
 		switch state {
 		default:
 			panic("bad state")
 		case stateLoad:
-			// TODO(marius): inbound transfers and loading shoud be concurrent.
-			g, ctx := errgroup.WithContext(ctx)
+			task.set(TaskStaging)
+			if s.TaskDB != nil && tctx == nil {
+				// disable govet check due to https://github.com/golang/go/issues/29587
+				tctx, tcancel = context.WithCancel(ctx) //nolint: govet
+				if taskdbErr := s.TaskDB.CreateTask(tctx, task.ID, task.RunID, task.FlowID, taskdb.NewImgCmdID(task.Config.Image, task.Config.Cmd), task.Config.Ident, ""); taskdbErr != nil {
+					task.Log.Errorf("taskdb createtask: %v", taskdbErr)
+				} else {
+					go func() { _ = taskdb.KeepTaskAlive(tctx, s.TaskDB, task.ID) }()
+				}
+			}
 			for i, arg := range task.Config.Args {
 				if arg.Fileset == nil {
 					continue
 				}
-				i, arg := i, arg
+				loadedData.Store(i, false)
+			}
+			g, gctx := errgroup.WithContext(ctx)
+			loadedData.Range(func(key, value interface{}) bool {
+				if value.(bool) {
+					return true
+				}
+				i := key.(int)
+				arg := task.Config.Args[i]
 				g.Go(func() error {
-					task.Log.Debugf("loading %v", *arg.Fileset)
-					fs, err := alloc.Load(ctx, *arg.Fileset)
-					if err != nil {
-						return err
+					task.Log.Debugf("loading %s", (*arg.Fileset).Short())
+					fs, lerr := alloc.Load(gctx, s.Repository.URL(), *arg.Fileset)
+					if lerr != nil {
+						return lerr
 					}
-					task.Log.Debugf("loaded %v", fs)
+					task.Log.Debugf("loaded %s", fs.Short())
 					task.Config.Args[i].Fileset = &fs
+					loadedData.Store(i, true)
 					return nil
 				})
-			}
+				return true
+			})
 			err = g.Wait()
-		case stateTransferIn:
-			task.set(TaskStaging)
-			fs := reflow.Fileset{List: make([]reflow.Fileset, 0, len(task.Config.Args))}
-			for _, arg := range task.Config.Args {
-				if arg.Fileset != nil {
-					fs.List = append(fs.List, *arg.Fileset)
+		case statePut:
+			x, err = alloc.Put(ctx, digest.Digest(task.ID), task.Config)
+		case stateWait:
+			if s.TaskDB != nil {
+				if taskdbErr := s.TaskDB.SetTaskUri(tctx, task.ID, x.URI()); taskdbErr != nil {
+					task.Log.Errorf("taskdb settaskuri: %v", taskdbErr)
 				}
 			}
-			var files []reflow.File
-			files, err = s.Transferer.NeedTransfer(ctx, alloc.Repository(), fs.Files()...)
-			if err != nil || len(files) == 0 {
-				break
-			}
-			err = s.Transferer.Transfer(ctx, alloc.Repository(), s.Repository, files...)
-		case statePut:
-			x, err = alloc.Put(ctx, task.ID, task.Config)
-		case stateWait:
 			task.Exec = x
 			task.set(TaskRunning)
 			err = x.Wait(ctx)
+			if s.TaskDB != nil {
+				if taskdbErr := s.TaskDB.SetTaskResult(tctx, task.ID, x.ID()); taskdbErr != nil {
+					task.Log.Errorf("taskdb settaskresult: %v", taskdbErr)
+				}
+			}
+		case stateVerify:
+			g, gctx := errgroup.WithContext(ctx)
+			loadedData.Range(func(key, value interface{}) bool {
+				i := key.(int)
+				fs := *task.Config.Args[i].Fileset
+				g.Go(func() error {
+					task.Log.Debugf("verifying %v", fs.Short())
+					uerr := alloc.VerifyIntegrity(gctx, fs)
+					if uerr == nil {
+						task.Log.Debugf("verified %v", fs.Short())
+					}
+					task.Log.Debugf("verify %v: %s", fs.Short(), uerr)
+					return uerr
+				})
+				return true
+			})
+			err = g.Wait()
 		case statePromote:
 			err = x.Promote(ctx)
 		case stateInspect:
@@ -388,47 +546,213 @@ func (s *Scheduler) run(task *Task, returnc chan<- *Task) {
 			task.Result, err = x.Result(ctx)
 		case stateTransferOut:
 			files := task.Result.Fileset.Files()
-			files, err = s.Transferer.NeedTransfer(ctx, s.Repository, files...)
-			if err != nil {
-				break
-			}
 			err = s.Transferer.Transfer(ctx, s.Repository, alloc.Repository(), files...)
+		case stateUnload:
+			err = unload(ctx, task, &loadedData, alloc, &resultUnloaded)
 		}
-		if err == nil {
-			task.Log.Debugf("scheduler: %s", state)
-			n = 0
-			state++
-		} else if err == ctx.Err() {
-			break
-		} else {
-			// TODO(marius): terminate early on NotSupported, Invalid
-			task.Log.Debugf("scheduler: %s: %s; try %d", state, err, n+1)
+		next, msg := state.next(ctx, err, s.PostUseChecksum)
+		task.Log.Debugf("%s (try %d): %s, next state: %s", state, n, msg, next)
+		if next == state {
 			n++
+		} else {
+			n = 0
+		}
+		state = next
+	}
+	// Clean up the loaded data in case we exited early without unloading (usually due to an error in an earlier state)
+	if err != nil {
+		if unloadErr := unload(ctx, task, &loadedData, alloc, &resultUnloaded); unloadErr != nil {
+			task.Log.Debugf("error unloading data after task failure, this wastes disk space on the alloc: %s", unloadErr)
 		}
 	}
 	task.Err = err
-	if err != nil && err == ctx.Err() {
+	switch {
+	case err == nil:
+		task.set(TaskDone)
+	case errors.Is(errors.Canceled, err):
+		task.Config.Args = savedArgs
 		task.set(TaskLost)
-	} else {
+	case errors.Restartable(err):
+		task.Config.Args = savedArgs
+		task.set(TaskLost)
+	default:
 		task.set(TaskDone)
 	}
 	returnc <- task
 }
 
+func unload(ctx context.Context, task *Task, loadedData *sync.Map, alloc *alloc, resultUnloaded *bool) error {
+	g, gctx := errgroup.WithContext(ctx)
+	loadedData.Range(func(key, value interface{}) bool {
+		i := key.(int)
+		fs := *task.Config.Args[i].Fileset
+		g.Go(func() error {
+			task.Log.Debugf("unloading %v", fs.Short())
+			uerr := alloc.Unload(gctx, fs)
+			if uerr != nil {
+				return uerr
+			}
+			task.Log.Debugf("unloaded %v", fs.Short())
+			loadedData.Delete(i)
+			return nil
+		})
+		return true
+	})
+	// Extern loads the files to be externed and gets unloaded above. Extern's result
+	// fileset includes files that were externed and not necessarily any new data
+	// that was produced. Hence we don't need to unload the result.
+	if task.Config.Type != "extern" && !*resultUnloaded {
+		g.Go(func() error {
+			fs := task.Result.Fileset
+			task.Log.Debugf("unloading %v", fs.Short())
+			uerr := alloc.Unload(gctx, fs)
+			if uerr != nil {
+				return uerr
+			}
+			task.Log.Debugf("unloaded %v", fs.Short())
+			*resultUnloaded = true
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+func (s *Scheduler) directTransfer(ctx context.Context, task *Task) {
+	const identifier = "scheduler.directTransfer"
+	taskLogger := task.Log.Tee(nil, "direct transfer: ")
+	if s.TaskDB != nil {
+		taskdbErr := s.TaskDB.CreateTask(ctx, task.ID, task.RunID, task.FlowID, taskdb.ImgCmdID(digest.Digest{}), identifier, "local")
+		if taskdbErr != nil {
+			taskLogger.Errorf("taskdb createtask: %v", taskdbErr)
+		} else {
+			tctx, tcancel := context.WithCancel(ctx)
+			defer func() {
+				if err := s.TaskDB.SetTaskComplete(context.Background(), task.ID, task.Err, time.Now()); err != nil {
+					taskLogger.Errorf("taskdb settaskcomplete: %v", err)
+				}
+				tcancel()
+			}()
+			go func() { _ = taskdb.KeepTaskAlive(tctx, s.TaskDB, task.ID) }()
+		}
+	}
+	task.set(TaskRunning)
+	task.Err = s.doDirectTransfer(ctx, task)
+	if task.Err != nil && errors.Is(errors.NotSupported, task.Err) {
+		taskLogger.Debugf("switching to non-direct %v", task.Err)
+		task.nonDirectTransfer = true
+		task.set(TaskLost)
+		s.submitc <- []*Task{task}
+		return
+	}
+	if task.Err != nil {
+		taskLogger.Error(task.Err)
+	}
+	if s.TaskDB != nil && task.Result.Err == nil {
+		if err := s.TaskDB.SetTaskResult(ctx, task.ID, task.Result.Fileset.Digest()); err != nil {
+			taskLogger.Errorf("taskdb settaskresult: %v", err)
+		}
+	}
+	task.set(TaskDone)
+}
+
 func requirements(tasks []*Task) reflow.Requirements {
 	// TODO(marius): We should revisit this requirements model and how
-	// it interacts with the underlying cluster providers. Specifically,
-	// this approach can be very conservative if we have a mix of tasks
-	// that require different resource types or vary widely in
-	// magnitudes across the same resource dimensions. This could even
-	// lead to unattainable allocations that could theoretically be
-	// satisfied by multiple allocs. Doing this properly requires
-	// changing the interaction model between the scheduler and cluster
-	// so that the cluster presents a "menu" of different alloc types,
-	// and the scheduler is allowed to pick from this menu.
-	var req reflow.Requirements
-	for _, task := range tasks {
-		req.AddParallel(task.Config.Resources)
+	// it interacts with the underlying cluster providers. Doing this
+	// optimally requires changing the interaction model between the
+	// scheduler and cluster so that the cluster presents a "menu" of
+	// different alloc types, and the scheduler is allowed to pick from this menu.
+
+	// We create a minimum requirement matching the resource needs of the largest task
+	// and then expand its width by packing tasks as tightly as possible.
+	var (
+		req  reflow.Requirements
+		have reflow.Resources
+		i    int
+	)
+	tasksCopy := append([]*Task{}, tasks...)
+	// Sort the tasks by resource needs
+	sort.Slice(tasksCopy, func(i, j int) bool {
+		return tasksCopy[i].Config.Resources.ScaledDistance(nil) > tasksCopy[j].Config.Resources.ScaledDistance(nil)
+	})
+	for len(tasksCopy) > 0 {
+		i = sort.Search(len(tasksCopy), func(i int) bool {
+			return have.Available(tasksCopy[i].Config.Resources)
+		})
+		if i == len(tasksCopy) {
+			// Found nothing, so add the current biggest task's resources
+			req.AddParallel(tasksCopy[0].Config.Resources)
+			i = 0
+			// Reset current available resources
+			have.Set(req.Min)
+		}
+		// Found the biggest one which'll fit in the current available resources.
+		have.Sub(have, tasksCopy[i].Config.Resources)
+		tasksCopy = append(tasksCopy[0:i], tasksCopy[i+1:]...)
 	}
 	return req
+}
+
+// doDirectTransfer attempts to do a direct transfer for externs.
+// Direct transfers are supported only if the scheduler's Repository
+// and the destination repository are both blob stores.
+func (s *Scheduler) doDirectTransfer(ctx context.Context, task *Task) error {
+	taskLogger := task.Log.Tee(nil, "direct transfer: ")
+	if task.Config.Type != "extern" {
+		panic("direct transfers only supported for extern")
+	}
+	if len(task.Config.Args) != 1 {
+		return errors.E(errors.Precondition,
+			errors.Errorf("unexpected args (must be 1, but was %d): %v", len(task.Config.Args), task.Config.Args))
+	}
+	// Check if the scheduler's repository supports blobLocator.
+	fileLocator, ok := s.Repository.(blobLocator)
+	if !ok {
+		return errors.E(errors.NotSupported, errors.New("scheduler repository does not support locating blobs"))
+	}
+	// Check if the destination is a blob store.
+	if _, _, err := s.Mux.Bucket(ctx, task.Config.URL); err != nil {
+		return err
+	}
+
+	fs := task.Config.Args[0].Fileset.Pullup()
+	for _, f := range fs.Files() {
+		if f.IsRef() {
+			return errors.E(errors.NotSupported, errors.New("unresolved files not supported"))
+		}
+	}
+	task.mu.Lock()
+	task.Result.Fileset.Map = map[string]reflow.File{}
+	task.mu.Unlock()
+
+	extUrl := strings.TrimSuffix(task.Config.URL, "/")
+
+	g, ctx := errgroup.WithContext(ctx)
+	for k, v := range fs.Map {
+		filename, file := k, v
+		g.Go(func() error {
+			srcUrl, err := fileLocator.Location(ctx, file.ID)
+			if err != nil {
+				return err
+			}
+			dstUrl := extUrl + "/" + filename
+			if filename == "." {
+				dstUrl = extUrl
+			}
+			start := time.Now()
+			if err = s.Mux.Transfer(ctx, dstUrl, srcUrl); err != nil {
+				return errors.E(fmt.Sprintf("scheduler direct transfer: %s -> %s", srcUrl, dstUrl), err)
+			}
+			dur := time.Since(start).Round(time.Second)
+			if dur < 1 {
+				dur += time.Second
+			}
+			taskLogger.Debugf("completed %s -> %s (%s) in %s (%s/s) ", srcUrl, dstUrl, data.Size(file.Size), dur, data.Size(file.Size/int64(dur.Seconds())))
+			task.mu.Lock()
+			task.Result.Fileset.Map[filename] = file
+			task.mu.Unlock()
+			return err
+		})
+	}
+	task.Result.Err = errors.Recover(g.Wait())
+	return nil
 }

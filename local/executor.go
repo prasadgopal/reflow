@@ -8,16 +8,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"time"
 
+	"docker.io/go-docker"
+	"docker.io/go-docker/api/types"
+	"docker.io/go-docker/api/types/container"
 	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
 	"github.com/grailbio/base/digest"
+	"github.com/grailbio/base/traverse"
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/blob"
 	"github.com/grailbio/reflow/errors"
@@ -67,7 +73,7 @@ type Executor struct {
 	// within it.
 	Dir string
 	// Client is the Docker client used by this executor.
-	Client *client.Client
+	Client *docker.Client
 	// Authenticator is used to pull images that are stored on Amazon's ECR
 	// service.
 	Authenticator ecrauth.Interface
@@ -90,6 +96,9 @@ type Executor struct {
 	// default implementation when (*Executor).Start is called.
 	FileRepository *filerepo.Repository
 
+	// HardMemLimit restricts an exec's memory limit to the exec's resource requirements
+	HardMemLimit bool
+
 	Blob blob.Mux
 
 	// remoteStream is the client used to write logs to a remote cloud
@@ -103,16 +112,58 @@ type Executor struct {
 	cancel context.CancelFunc
 	ctx    context.Context
 
-	mu    sync.Mutex
-	dead  bool                   // tells whether the executor is dead
-	execs map[digest.Digest]exec // the set of execs managed by this executor.
+	mu         sync.Mutex
+	dead       bool                   // tells whether the executor is dead
+	execs      map[digest.Digest]exec // the set of execs managed by this executor.
+	oomTracker *oomTracker
+
+	// reference count of the objects in the executor repository.
+	refCountsMu   sync.Mutex
+	refCounts     map[digest.Digest]refCount
+	refCountsCond *sync.Cond
+	deadObjects   map[digest.Digest]bool
+	gcing         chan struct{}
+}
+
+type refCount struct {
+	count          int64
+	lastAccessTime time.Time
+}
+
+// incr increments the reference count of the specified object while
+// ensuring that it waits for an GC in progress on that object.
+func (e *Executor) incr(d digest.Digest) {
+	e.refCountsMu.Lock()
+	for e.deadObjects[d] {
+		e.refCountsCond.Wait()
+	}
+	r := e.refCounts[d]
+	e.refCounts[d] = refCount{count: r.count + 1, lastAccessTime: time.Now()}
+	e.refCountsMu.Unlock()
+}
+
+func (e *Executor) decr(id digest.Digest) {
+	e.refCountsMu.Lock()
+	saved := e.refCounts[id]
+	if e.deadObjects[id] {
+		panic(fmt.Sprintf("gc: decrement while gc is in progress: %v", id))
+	}
+	e.refCounts[id] = refCount{saved.count - 1, saved.lastAccessTime}
+	e.refCountsMu.Unlock()
 }
 
 // Start initializes the executor and recovers previously stored
 // state. It re-initializes all stored execs.
 func (e *Executor) Start() error {
+	e.refCountsCond = sync.NewCond(&e.refCountsMu)
+	e.deadObjects = make(map[digest.Digest]bool)
 	e.execs = map[digest.Digest]exec{}
+	e.refCounts = make(map[digest.Digest]refCount)
 	e.ctx, e.cancel = context.WithCancel(context.Background())
+	// Monitor /dev/kmsg for OOMs.
+	e.oomTracker = newOOMTracker()
+	go e.oomTracker.Monitor(e.ctx, e.Log)
+
 	if e.FileRepository == nil {
 		e.FileRepository = &filerepo.Repository{Root: filepath.Join(e.Prefix, e.Dir, objectsDir)}
 	}
@@ -166,8 +217,10 @@ func (e *Executor) Start() error {
 		case execBlob:
 			_, stderr := e.getRemoteStreams(id, false, true)
 			blobx := &blobExec{
-				ExecID: id,
-				log:    e.Log.Tee(stderr, ""),
+				ExecID:       id,
+				transferType: m.Config.Type,
+				log:          e.Log.Tee(stderr, ""),
+				x:            e,
 			}
 			blobx.Init(e)
 			blobx.Manifest = m
@@ -186,7 +239,7 @@ func (e *Executor) Start() error {
 // at the local Docker client.
 // TODO(marius): image pulling may be(?) better off as part of the executor interface
 func (e *Executor) ensureImage(ctx context.Context, ref string) error {
-	return ensureImage(ctx, e.Client, e.Authenticator, ref)
+	return ensureImage(ctx, e.Client, e.Authenticator, ref, e.Log)
 }
 
 // execPath constructs a path for the exec with the given id.
@@ -236,13 +289,32 @@ func (e *Executor) Put(ctx context.Context, id digest.Digest, cfg reflow.ExecCon
 		e.mu.Unlock()
 		return nil, errors.E("put", id, errors.NotExist)
 	}
+
+	var x exec
 	if obj := e.execs[id]; obj != nil {
-		e.mu.Unlock()
-		return obj, nil
+		res, err := obj.Result(ctx)
+		// Will return an existing obj only if either
+		// - there was no error during its execution and the result wasn't an error
+		// - or the only error we got back signifies that the obj isn't complete yet.
+		if err == nil && res.Err == nil {
+			x = obj
+		} else if err != nil && strings.Contains(err.Error(), errExecNotComplete) {
+			x = obj
+		} else {
+			e.Log.Debugf("put %s overwriting existing exec: %s", id.Short(), obj.URI())
+			if err := obj.Kill(ctx); err != nil {
+				e.Log.Debugf("kill existing %s: %v", id, err)
+			}
+			delete(e.execs, id)
+		}
 	}
-	var exec exec
+	if x != nil {
+		e.mu.Unlock()
+		return x, nil
+	}
+
 	switch cfg.Type {
-	case "intern", "extern":
+	case intern, extern:
 		u, err := url.Parse(cfg.URL)
 		if err != nil {
 			e.mu.Unlock()
@@ -250,25 +322,27 @@ func (e *Executor) Put(ctx context.Context, id digest.Digest, cfg reflow.ExecCon
 		}
 		switch u.Scheme {
 		case "localfile":
-			exec = newLocalfileExec(id, e, cfg)
+			x = newLocalfileExec(id, e, cfg)
 		default:
 			_, stderr := e.getRemoteStreams(id, false, true)
 			blob := &blobExec{
-				ExecID: id,
-				log:    e.Log.Tee(stderr, ""),
+				ExecID:       id,
+				transferType: cfg.Type,
+				log:          e.Log.Tee(stderr, ""),
+				x:            e,
 			}
 			blob.Config = cfg
 			blob.Init(e)
-			exec = blob
+			x = blob
 		}
 	default:
 		stdout, stderr := e.getRemoteStreams(id, true, true)
-		exec = newDockerExec(id, e, cfg, log.New(stdout, log.InfoLevel), log.New(stderr, log.InfoLevel))
+		x = newDockerExec(id, e, cfg, log.New(stdout, log.InfoLevel), log.New(stderr, log.InfoLevel))
 	}
-	e.execs[id] = exec
+	e.execs[id] = x
 	e.mu.Unlock()
-	go exec.Go(e.ctx)
-	return exec, exec.WaitUntil(execInit)
+	go x.Go(e.ctx)
+	return x, x.WaitUntil(execInit)
 }
 
 // Get returns the exec named ID, or an errors.NotExist if the exec
@@ -308,21 +382,149 @@ func (e *Executor) Remove(ctx context.Context, id digest.Digest) error {
 	return nil
 }
 
-func (e *Executor) Load(ctx context.Context, fs reflow.Fileset) (reflow.Fileset, error) {
+// Unload decrements the reference count of the fileset objects. If any object's reference
+// count is 0, then unload marks it for deletion. A GC goroutine separately collects these
+// marked objects. The returned channel is closed when the GC is complete.
+func (e *Executor) unload(ctx context.Context, fs reflow.Fileset) (done <-chan struct{}, err error) {
+	files := fs.Files()
+	e.refCountsMu.Lock()
+	for _, f := range files {
+		d := f.Digest()
+		r := e.refCounts[d]
+		e.refCounts[d] = refCount{count: r.count - 1, lastAccessTime: r.lastAccessTime}
+		if e.refCounts[d].count < 0 {
+			panic(fmt.Sprintf("unload: negative ref count: %v", f.Digest()))
+		}
+		if e.refCounts[d].count == 0 {
+			e.deadObjects[d] = true
+		}
+	}
+	if e.gcing != nil {
+		done = e.gcing
+		e.refCountsMu.Unlock()
+		return
+	}
+	e.gcing = make(chan struct{})
+	done = e.gcing
+	e.refCountsMu.Unlock()
+	go func() {
+		e.refCountsMu.Lock()
+		defer e.refCountsMu.Unlock()
+		for len(e.deadObjects) > 0 {
+			for id := range e.deadObjects {
+				e.refCountsMu.Unlock()
+				if err := e.FileRepository.Remove(id); err != nil {
+					e.Log.Errorf("gc: unload dead collect: %v", err)
+				}
+				e.refCountsMu.Lock()
+				delete(e.deadObjects, id)
+				if e.refCounts[id].count > 0 {
+					panic(fmt.Sprintf("gc: refcount %v not 0: %v", id.Short(), e.refCounts[id].count))
+				}
+				delete(e.refCounts, id)
+				e.refCountsCond.Broadcast()
+			}
+		}
+		close(e.gcing)
+		e.gcing = nil
+	}()
+	return
+}
+
+// Unload unloads the fileset from the executor repository. When the fileset's reference count drops to zero,
+// the executor may choose to remove the fileset from its repository.
+func (e *Executor) Unload(ctx context.Context, fs reflow.Fileset) error {
+	_, err := e.unload(ctx, fs)
+	return err
+}
+
+// VerifyIntegrity verifies the integrity of the given set of files
+func (e *Executor) VerifyIntegrity(ctx context.Context, fs reflow.Fileset) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	g, ctx := errgroup.WithContext(ctx)
+	files := fs.Files()
+	err := traverse.Limit(runtime.NumCPU()).Each(len(files), func(i int) error {
+		file := files[i]
+		if file.IsRef() {
+			return errors.E(fmt.Sprintf("unresolved file %s", file), errors.Invalid)
+		}
+		if _, err := e.FileRepository.Stat(ctx, file.ID); err != nil {
+			return errors.E(errors.NotExist, err)
+		}
+		rc, err := e.FileRepository.Get(ctx, file.ID)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rc.Close() }()
+		w := reflow.Digester.NewWriter()
+		if _, err := io.Copy(w, rc); err != nil {
+			return err
+		}
+		d := w.Digest()
+		if file.ID != d {
+			return errors.E(fmt.Sprintf("digest %s mismatches ID %s", d.Short(), file.ID.Short()), file.ID, errors.Integrity)
+		}
+		return nil
+	})
+	if err != nil {
+		return errors.E("verifyintegrity", err)
+	}
+	return nil
+}
+
+func (e *Executor) refCount(fs reflow.Fileset) {
+	for _, f := range fs.Files() {
+		e.incr(f.Digest())
+	}
+}
+
+// Load loads the fileset into the executor repository. If the fileset is resolved, it is loaded from the
+// specified backing repository. Else the file is loaded from its source.
+func (e *Executor) Load(ctx context.Context, repo *url.URL, fs reflow.Fileset) (reflow.Fileset, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	var (
 		mu       sync.Mutex
-		resolved = make(map[reflow.File]reflow.File)
+		resolved = make(map[digest.Digest]reflow.File)
 		files    = fs.Files()
+		tempRepo filerepo.Repository
+		err      error
 	)
-	for i := range files {
+	tempRepo.Root, err = ioutil.TempDir(e.FileRepository.Root, "temp-load")
+	defer os.RemoveAll(tempRepo.Root)
+	if err != nil {
+		return reflow.Fileset{}, err
+	}
+	err = traverse.Each(len(files), func(i int) error {
 		file := files[i]
 		if !file.IsRef() {
-			continue
+			d := file.Digest()
+			e.incr(d)
+			// TODO(pgopal): change ReadFrom to return (reflow.File, error).
+			rerr := e.FileRepository.ReadFrom(ctx, d, repo)
+			if rerr != nil {
+				e.decr(d)
+				return rerr
+			}
+			var res reflow.File
+			if res, rerr = e.FileRepository.Stat(ctx, d); rerr != nil {
+				return rerr
+			}
+			mu.Lock()
+			resolved[d] = res
+			mu.Unlock()
+			return nil
 		}
-		g.Go(func() error {
+		var (
+			incr bool
+			res  reflow.File
+		)
+		if !file.ContentHash.IsZero() {
+			incr = true
+			e.incr(file.ContentHash)
+			res, err = fileFromRepo(ctx, e.FileRepository, file)
+		}
+		if file.ContentHash.IsZero() || err != nil {
 			bucket, key, err := e.Blob.Bucket(ctx, file.Source)
 			if err != nil {
 				return err
@@ -330,20 +532,26 @@ func (e *Executor) Load(ctx context.Context, fs reflow.Fileset) (reflow.Fileset,
 			dl := download{
 				Bucket: bucket,
 				Key:    key,
-				Size:   file.Size,
-				ETag:   file.ETag,
+				File:   file,
 				Log:    e.Log,
 			}
-			res, err := dl.Do(ctx, e.FileRepository)
-			if err == nil {
-				mu.Lock()
-				resolved[file] = res
-				mu.Unlock()
+			res, err = dl.Do(ctx, &tempRepo)
+			if err != nil {
+				return err
 			}
-			return err
-		})
+			if !incr {
+				e.incr(res.Digest())
+			}
+		}
+		mu.Lock()
+		resolved[file.Digest()] = res
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		return reflow.Fileset{}, err
 	}
-	if err := g.Wait(); err != nil {
+	if err := e.FileRepository.Vacuum(ctx, &tempRepo); err != nil {
 		return reflow.Fileset{}, err
 	}
 	x, ok := fs.Subst(resolved)
@@ -379,6 +587,11 @@ func (e *Executor) Execs(ctx context.Context) ([]reflow.Exec, error) {
 	return execs, nil
 }
 
+func (e *Executor) promote(ctx context.Context, res reflow.Fileset, repo *filerepo.Repository) error {
+	e.refCount(res)
+	return e.FileRepository.Vacuum(ctx, repo)
+}
+
 // Kill disposes of the executors and all of its execs. It also sets
 // the executor's "dead" flag, so that all future operations on the
 // executor returns an error.
@@ -408,9 +621,13 @@ func (e *Executor) Kill(ctx context.Context) error {
 			continue
 		}
 		e.Client.ContainerKill(ctx, c.ID, "KILL")
-		_, err := e.Client.ContainerWait(ctx, c.ID)
-		if client.IsErrNotFound(err) {
-			continue
+		respc, errc := e.Client.ContainerWait(ctx, c.ID, container.WaitConditionNotRunning)
+		select {
+		case err := <-errc:
+			if docker.IsErrNotFound(err) {
+				continue
+			}
+		case <-respc:
 		}
 		e.Client.ContainerRemove(ctx, c.ID, types.ContainerRemoveOptions{Force: true})
 	}
@@ -424,14 +641,7 @@ func (e *Executor) Kill(ctx context.Context) error {
 // particular, it rewrites interns and externs (which are not
 // intrinsic) to execs implementing those operations.
 func (e *Executor) rewriteConfig(cfg *reflow.ExecConfig) error {
-	if cfg.Image != "" {
-		cfg.NeedAWSCreds = strings.HasSuffix(cfg.Image, "$aws")
-		cfg.Image = strings.TrimSuffix(cfg.Image, "$aws")
-		if cfg.Image == "" {
-			cfg.Image = e.AWSImage
-		}
-	}
-	if cfg.Type != "intern" && cfg.Type != "extern" {
+	if cfg.Type != intern && cfg.Type != extern {
 		return nil
 	}
 	u, err := url.Parse(cfg.URL)
@@ -442,7 +652,7 @@ func (e *Executor) rewriteConfig(cfg *reflow.ExecConfig) error {
 	case "localfile":
 		return nil
 	case "s3", "s3f":
-		if !e.ExternalS3 && cfg.Type == "intern" {
+		if !e.ExternalS3 {
 			return nil
 		}
 	default:
@@ -460,7 +670,7 @@ func (e *Executor) rewriteConfig(cfg *reflow.ExecConfig) error {
 	// [1] e.g., see https://github.com/aws/aws-cli/issues/2401
 	const awsCLIFlags = `--cli-read-timeout 1200 --cli-connect-timeout 1200`
 	switch cfg.Type {
-	case "intern":
+	case intern:
 		switch u.Scheme {
 		case "s3":
 			cfg.Cmd = fmt.Sprintf(`
@@ -502,7 +712,7 @@ func (e *Executor) rewriteConfig(cfg *reflow.ExecConfig) error {
 			done
 			exit 1`, creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken, awsCLIFlags, uu.String())
 		}
-	case "extern":
+	case extern:
 		cfg.Cmd = fmt.Sprintf(`
 			aws configure set default.region us-west-2
 			export AWS_ACCESS_KEY_ID=%q
@@ -546,6 +756,9 @@ func (e *Executor) install(ctx context.Context, path string, replace bool, repo 
 		path, relpath, size := w.Path(), w.Relpath(), w.Info().Size()
 		g.Go(func() error {
 			file, err := repo.Install(path)
+			if err != nil {
+				return err
+			}
 			mu.Lock()
 			val.Map[relpath] = reflow.File{ID: file.ID, Size: size}
 			mu.Unlock()

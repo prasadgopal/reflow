@@ -12,8 +12,6 @@ import (
 	"io"
 	"sort"
 
-	"github.com/grailbio/reflow/config"
-	yaml "gopkg.in/yaml.v2"
 	"v.io/x/lib/textutil"
 )
 
@@ -38,29 +36,49 @@ modified and overriden:
 	// Construct a help string from the available providers.
 	b := new(bytes.Buffer)
 	b.WriteString(header)
-	usages := config.Help()
+
 	var keys []string
-	for key := range usages {
+	help := c.Config.Help()
+	for key := range help {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
-	for _, key := range keys {
-		usages := usages[key]
-		sort.Slice(usages, func(i, j int) bool {
-			return usages[i].Kind < usages[j].Kind
-		})
-		for _, usage := range usages {
-			fmt.Fprintf(b, "%s: %s", key, usage.Kind)
-			if arg := usage.Arg; arg != "" {
-				fmt.Fprintf(b, ",%s", arg)
+	var err error
+	for _, k := range keys {
+		v := help[k]
+		for _, p := range v {
+			fmt.Fprintf(b, "%s: %s", k, p.Name)
+			for _, arg := range p.Args {
+				fmt.Fprintf(b, ",%s", arg.Name)
 			}
 			b.WriteString("\n")
 			pw := textutil.PrefixLineWriter(b, "	")
 			ww := textutil.NewUTF8WrapWriter(pw, 80)
-			if _, err := io.WriteString(ww, usage.Usage); err != nil {
+			if _, err := io.WriteString(ww, p.Usage); err != nil {
 				c.Fatal(err)
 			}
+			hw := textutil.NewUTF8WrapWriter(pw, 80)
+			if len(p.Args) > 0 {
+				if _, err = io.WriteString(hw, "\n"); err != nil {
+					c.Fatal(err)
+				}
+			}
+
+			for _, arg := range p.Args {
+				if _, err = io.WriteString(hw, fmt.Sprintf("%s: %s", arg.Name, arg.Help)); err != nil {
+					c.Fatal(err)
+				}
+				if arg.DefaultValue != "" {
+					if _, err = io.WriteString(hw, fmt.Sprintf(" (default %q)", arg.DefaultValue)); err != nil {
+						c.Fatal(err)
+					}
+				}
+				if _, err = io.WriteString(hw, "\n"); err != nil {
+					c.Fatal(err)
+				}
+			}
 			ww.Flush()
+			hw.Flush()
 			pw.Flush()
 		}
 		b.WriteString("\n")
@@ -68,23 +86,16 @@ modified and overriden:
 	b.WriteString(footer)
 
 	c.Parse(flags, args, b.String(), "config")
+
 	if flags.NArg() != 0 {
 		flags.Usage()
 	}
-	var data []byte
-	if *marshalFlag {
-		var err error
-		data, err = config.Marshal(c.Config)
-		if err != nil {
-			c.Fatal(err)
-		}
-	} else {
-		var err error
-		data, err = yaml.Marshal(c.Config.Keys())
-		if err != nil {
-			c.Fatal(err)
-		}
+	// Do not marshal the key for reflow version.
+	delete(c.Config.Keys, "reflow")
+	data, err := c.Config.Marshal(*marshalFlag)
+	c.must(err)
+	if _, err = c.Stdout.Write(data); err != nil {
+		c.Fatal(err)
 	}
-	c.Stdout.Write(data)
 	c.Println()
 }

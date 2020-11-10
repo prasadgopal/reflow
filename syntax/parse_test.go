@@ -7,9 +7,13 @@ package syntax
 import (
 	"bytes"
 	"fmt"
+	"os"
+
+	"path/filepath"
 	"reflect"
 	"testing"
 
+	"github.com/grailbio/reflow/internal/walker"
 	"github.com/grailbio/reflow/types"
 	"github.com/grailbio/reflow/values"
 )
@@ -34,6 +38,26 @@ func TestParseTypeOk(t *testing.T) {
 		{"[string:dir]", types.Map(types.String, types.Dir)},
 		{"(int, dir)", types.Tuple(&types.Field{"", types.Int}, &types.Field{"", types.Dir})},
 		{"func(int, dir) dir", types.Func(types.Dir, &types.Field{"", types.Int}, &types.Field{"", types.Dir})},
+		{
+			"#One | #Two | #Three | #String(string)",
+			types.Sum(
+				&types.Variant{Tag: "One", Elem: nil},
+				&types.Variant{Tag: "Two"},
+				&types.Variant{Tag: "Three"},
+				&types.Variant{Tag: "String", Elem: types.String},
+			),
+		},
+		{
+			"#Int(int) | #String(string) | #IntOrString(#Int(int) | #String(string))",
+			types.Sum(
+				&types.Variant{Tag: "Int", Elem: types.Int},
+				&types.Variant{Tag: "String", Elem: types.String},
+				&types.Variant{Tag: "IntOrString", Elem: types.Sum(
+					&types.Variant{Tag: "Int", Elem: types.Int},
+					&types.Variant{Tag: "String", Elem: types.String},
+				)},
+			),
+		},
 		{
 			"{r1 file, r2 file, stats dir}",
 			types.Struct(
@@ -61,7 +85,7 @@ func TestParseTypeOk(t *testing.T) {
 	} {
 		p := Parser{Mode: ParseType, Body: bytes.NewReader([]byte(c.s))}
 		if err := p.Parse(); err != nil {
-			t.Errorf("parse error: %v", err)
+			t.Errorf("parse error on %q: %v", c.s, err)
 			continue
 		}
 		if got, want := p.Type, c.t; !got.StructurallyEqual(want) {
@@ -123,13 +147,13 @@ func TestParseDecls(t *testing.T) {
 			Kind: ExprAscribe,
 			Type: types.Int,
 			Left: &Expr{
-				Kind: ExprConst,
+				Kind: ExprLit,
 				Type: types.Int,
 				Val:  values.NewInt(111),
 			},
 		}},
 		{Kind: DeclAssign, Pat: &Pat{Kind: PatIdent, Ident: "Bar"}, Expr: &Expr{
-			Kind: ExprConst,
+			Kind: ExprLit,
 			Type: types.Int,
 			Val:  values.NewInt(123),
 		}},
@@ -141,7 +165,7 @@ func TestParseDecls(t *testing.T) {
 				{Kind: PatIgnore},
 			}},
 			Expr: &Expr{
-				Kind: ExprConst,
+				Kind: ExprLit,
 				Type: types.String,
 				Val:  "ok",
 			},
@@ -254,6 +278,185 @@ func TestParseTemplate(t *testing.T) {
 		}
 		if got, want := len(temp.Args), len(temp.Frags)-1; got != want {
 			t.Errorf("got %v, want %v", got, want)
+		}
+	}
+}
+
+func stringLit(s string) string {
+	return `"` + s + `"`
+}
+
+func rawStringLit(s string) string {
+	return "`" + s + "`"
+}
+
+func TestParseString(t *testing.T) {
+	for i, c := range []struct {
+		input string
+		want  string
+	}{
+		{stringLit(``), ""},
+		{stringLit(`hello`), "hello"},
+		{stringLit(`hello world`), "hello world"},
+		{stringLit(`hello\tworld`), "hello\tworld"},
+		// Note literal tab in next line.
+		{stringLit(`hello	world`), "hello\tworld"},
+		{rawStringLit(``), ""},
+		{rawStringLit(`hello`), "hello"},
+		{rawStringLit(`hello world`), "hello world"},
+		{rawStringLit(`hello\tworld`), "hello\\tworld"},
+		// Note literal tab in next line.
+		{rawStringLit(`hello	world`), "hello\tworld"},
+	} {
+		p := Parser{Mode: ParseExpr, Body: bytes.NewReader([]byte(c.input))}
+		if err := p.Parse(); err != nil {
+			t.Errorf("error parsing string %d: %v", i, c.input)
+		}
+		e := p.Expr
+		if got, want := e.Kind, ExprLit; got != want {
+			t.Errorf("got %v, want %v", got, want)
+		}
+		if got, want := e.Type, types.String; got != want {
+			t.Errorf("got %v, want %v", got, want)
+		}
+		if got, want := e.Val, c.want; got != want {
+			t.Errorf("got \"%v\", want \"%s\"", got, want)
+		}
+	}
+}
+
+func TestParsePat(t *testing.T) {
+	for _, c := range []struct {
+		input string
+		pat   *Pat // nil means that we expect a parse failure.
+	}{
+		{"", nil},
+		{"_", &Pat{Kind: PatIgnore}},
+		{"[]", nil},
+		{"[...]", nil},
+		{"[..., a]", nil},
+		{"[a, ..., b]", nil},
+		{
+			"[a]",
+			&Pat{
+				Kind: PatList,
+				List: []*Pat{{Kind: PatIdent, Ident: "a"}},
+			},
+		},
+		{
+			"[a, b]",
+			&Pat{
+				Kind: PatList,
+				List: []*Pat{
+					{Kind: PatIdent, Ident: "a"},
+					{Kind: PatIdent, Ident: "b"},
+				},
+			},
+		},
+		{
+			"[a, b, ...]",
+			&Pat{
+				Kind: PatList,
+				List: []*Pat{
+					{Kind: PatIdent, Ident: "a"},
+					{Kind: PatIdent, Ident: "b"},
+				},
+				Tail: &Pat{Kind: PatIgnore},
+			},
+		},
+		{
+			"[a, b, ...rest]",
+			&Pat{
+				Kind: PatList,
+				List: []*Pat{
+					{Kind: PatIdent, Ident: "a"},
+					{Kind: PatIdent, Ident: "b"},
+				},
+				Tail: &Pat{Kind: PatIdent, Ident: "rest"},
+			},
+		},
+		{
+			"[a, b, ...[c]]",
+			&Pat{
+				Kind: PatList,
+				List: []*Pat{
+					{Kind: PatIdent, Ident: "a"},
+					{Kind: PatIdent, Ident: "b"},
+				},
+				Tail: &Pat{
+					Kind: PatList,
+					List: []*Pat{{Kind: PatIdent, Ident: "c"}},
+				},
+			},
+		},
+		{
+			"(a, b)",
+			&Pat{
+				Kind: PatTuple,
+				List: []*Pat{
+					{Kind: PatIdent, Ident: "a"},
+					{Kind: PatIdent, Ident: "b"},
+				},
+			},
+		},
+	} {
+		p := Parser{Mode: ParsePat, Body: bytes.NewReader([]byte(c.input))}
+		err := p.Parse()
+		switch {
+		case err == nil && c.pat == nil:
+			t.Errorf("input %s: got %v, want failure to parse", c.input, p.Pat)
+		case err == nil && c.pat != nil:
+			if got, want := p.Pat, c.pat; !p.Pat.Equal(c.pat) {
+				t.Errorf("input %s: got %v, want %v", c.input, got, want)
+			}
+		case err != nil && c.pat == nil:
+			// Expected an error and got an error, so we're good.
+		case err != nil && c.pat != nil:
+			t.Errorf("input %s: got error %v, want %v", c.input, err, c.pat)
+		}
+	}
+}
+
+func TestParseSwitch(t *testing.T) {
+	p := Parser{Mode: ParseExpr, Body: bytes.NewReader([]byte(`
+		switch ["a", "b"] {
+			case [a, b]:
+				val aa = a;
+				val bb = b;
+				(aa, bb)
+			case [a]:
+				val aa = a;
+				(aa, aa)
+		}
+	`))}
+
+	if err := p.Parse(); err != nil {
+		t.Error(err)
+	}
+	expect := `switch(list(<string>const("a"), <string>const("b")), cases(case([a, b], block(assign(aa, ident("a")), assign(bb, ident("b")) in tuple(ident("aa"), ident("bb")))), case([a], block(assign(aa, ident("a")) in tuple(ident("aa"), ident("aa"))))))`
+	if got, want := p.Expr.String(), expect; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
+// TestSyntax tests if the current reflow syntax is backwards compatible with older .rf files
+func TestSyntax(t *testing.T) {
+	grail := os.Getenv("GRAIL")
+	if grail == "" {
+		t.Skip("$GRAIL is not defined")
+	}
+	var w walker.Walker
+	w.Init(filepath.Join(grail, "analysis"))
+	for w.Scan() {
+		path := w.Path()
+		info, _ := os.Stat(path)
+		if info.Mode().IsRegular() && filepath.Ext(path) == ".rf" {
+			file, _ := os.Open(path)
+			p := Parser{Mode: ParseModule, Body: file}
+			err := p.Parse()
+			if err != nil {
+				t.Errorf("%s is not parsable", path)
+			}
 		}
 	}
 }

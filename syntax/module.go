@@ -9,10 +9,12 @@ import (
 	"flag"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
-	"unicode"
-	"unicode/utf8"
 
+	"github.com/grailbio/reflow/flow"
+
+	"github.com/grailbio/reflow/internal/scanner"
 	"github.com/grailbio/reflow/types"
 	"github.com/grailbio/reflow/values"
 )
@@ -24,6 +26,98 @@ type Param struct {
 	Doc      string
 	Expr     *Expr
 	Required bool
+}
+
+type flagVal struct {
+	kind types.Kind
+	val  values.T
+	set  bool
+	// url is only used for dirs and files
+	url string
+}
+
+func (f flagVal) String() string {
+	// Files and dirs must always return their respective URL when String() is called.
+	if f.kind == types.FileKind || f.kind == types.DirKind {
+		return f.url
+	}
+	if f.val == nil {
+		return ""
+	}
+	switch f.kind {
+	case types.StringKind:
+		return f.val.(string)
+	case types.IntKind:
+		return f.val.(*big.Int).String()
+	case types.FloatKind:
+		return f.val.(*big.Float).String()
+	case types.BoolKind:
+		return strconv.FormatBool(f.val.(bool))
+	default:
+		return ""
+	}
+}
+
+func (f *flagVal) Set(value string) error {
+	switch f.kind {
+	case types.StringKind:
+		f.val = value
+	case types.IntKind:
+		var z big.Int
+		v, ok := z.SetString(value, 10)
+		if !ok {
+			return fmt.Errorf("cannot parse %q as integer", value)
+		}
+		f.val = v
+	case types.FloatKind:
+		var z big.Float
+		v, ok := z.SetString(value)
+		if !ok {
+			return fmt.Errorf("cannot parse %q as float", value)
+		}
+		f.val = v
+	case types.BoolKind:
+		v, err := strconv.ParseBool(value)
+		if err != nil {
+			return err
+		}
+		f.val = v
+	case types.FileKind, types.DirKind:
+		ident := "file"
+		if f.kind == types.DirKind {
+			ident = "dir"
+		}
+		e := &Expr{
+			Kind: ExprApply,
+			Left: &Expr{
+				Kind:  ExprIdent,
+				Ident: ident,
+			},
+			Fields: []*FieldExpr{
+				{
+					Expr: &Expr{
+						Kind: ExprLit,
+						Val:  values.T(value),
+					},
+				},
+			},
+		}
+		_, venv := Stdlib()
+		v, err := e.eval(nil, venv, "")
+		if err != nil {
+			return err
+		}
+		f.url = value
+		f.val = v
+	default:
+		panic(f.kind)
+	}
+	f.set = true
+	return nil
+}
+
+func (f flagVal) IsBoolFlag() bool {
+	return f.kind == types.BoolKind
 }
 
 // Module abstracts a Reflow module, having the ability to type check
@@ -45,8 +139,12 @@ type Module interface {
 	Params() []Param
 	// Doc returns the docstring for a toplevel identifier.
 	Doc(string) string
-	// Type returns the type of the module.
-	Type() *types.T
+	// Type returns the type of the module, given the types of the
+	// parameters passed. Typechecking is done at the module's creation
+	// time, but this creates predicated const types. The returned type
+	// satisfies all predicates implied by the provided params, and thus
+	// represents a unique type for an instantiation site.
+	Type(params *types.Env) *types.T
 	// Eager tells whether the module requires eager parameters.
 	// When it does, all parameters are forced and fully evaluated
 	// before instantiating a new module instance.
@@ -81,8 +179,13 @@ type ModuleImpl struct {
 	tenv   *types.Env
 
 	injectedArgs []string
+	flags        *flag.FlagSet
 	fenv         *values.Env
 	ftenv        *types.Env
+
+	penv       *types.Env
+	predicates types.Predicates
+	required   map[string]bool
 }
 
 // Source gets the source code of this module.
@@ -97,11 +200,21 @@ func (m *ModuleImpl) Eager() bool { return false }
 func (m *ModuleImpl) Init(sess *Session, env *types.Env) error {
 	var el errlist
 	env = env.Push()
+	defer reportUnused(sess, env)
+	m.required = make(map[string]bool)
+	m.predicates = make(types.Predicates)
 	for _, p := range m.ParamDecls {
-		// TODO(marius): enforce no flow types here.
+		// TODO(marius): enforce const types here?
 		if err := p.Init(sess, env); err != nil {
 			el = el.Append(err)
 			continue
+		}
+		// The constedness of parameters must also be predicated on
+		// their instantiations being const.
+		if p.Type.Level == types.Const {
+			pred := types.FreshPredicate()
+			m.predicates.Add(pred)
+			p.Type = p.Type.Const(pred)
 		}
 		switch p.Kind {
 		default:
@@ -110,13 +223,16 @@ func (m *ModuleImpl) Init(sess *Session, env *types.Env) error {
 		case DeclError:
 			el = el.Errorf(p.Position, "declaration error")
 		case DeclDeclare:
-			env.Bind(p.Ident, p.Type)
+			env.Bind(p.Ident, p.Type, p.Position, types.Never)
+			m.required[p.Ident] = true
 		case DeclAssign:
-			if err := p.Pat.BindTypes(env, p.Type); err != nil && p.Type.Kind != types.ErrorKind {
+			if err := p.Pat.BindTypes(env, p.Type, types.Never); err != nil && p.Type.Kind != types.ErrorKind {
 				p.Type = types.Error(err)
 			}
 		}
 	}
+	m.penv = env.Pop()
+
 	for _, d := range m.Decls {
 		if err := d.Init(sess, env); err != nil {
 			el = el.Append(err)
@@ -130,7 +246,7 @@ func (m *ModuleImpl) Init(sess *Session, env *types.Env) error {
 		case DeclType:
 			env.BindAlias(d.Ident, d.Type)
 		case DeclAssign, DeclDeclare:
-			if err := d.Pat.BindTypes(env, d.Type); err != nil {
+			if err := d.Pat.BindTypes(env, d.Type, types.Unexported); err != nil {
 				d.Type = types.Error(err)
 				el = el.Error(d.Position, err)
 			}
@@ -146,19 +262,17 @@ func (m *ModuleImpl) Init(sess *Session, env *types.Env) error {
 	for _, d := range m.Decls {
 		switch d.Kind {
 		case DeclType:
-			first, _ := utf8.DecodeRuneInString(d.Ident)
-			if first == utf8.RuneError || !unicode.IsUpper(first) {
+			if !types.IsExported(d.Ident) {
 				continue
 			}
 			m.Docs[d.Ident] = d.Comment
 			aliases = append(aliases, &types.Field{Name: d.Ident, T: d.Type})
 		case DeclAssign, DeclDeclare:
 			env := types.NewEnv()
-			d.Pat.BindTypes(env, d.Type)
+			d.Pat.BindTypes(env, d.Type, types.Unexported)
 			for id, t := range env.Symbols() {
 				m.Docs[id] = d.Comment
-				first, _ := utf8.DecodeRuneInString(id)
-				if first == utf8.RuneError || !unicode.IsUpper(first) {
+				if !types.IsExported(id) {
 					continue
 				}
 				fields = append(fields, &types.Field{Name: id, T: t})
@@ -172,19 +286,7 @@ func (m *ModuleImpl) Init(sess *Session, env *types.Env) error {
 // Param returns the type  of the module parameter with identifier id,
 // and whether it is mandatory.
 func (m *ModuleImpl) Param(id string) (*types.T, bool) {
-	env := types.NewEnv()
-	for _, p := range m.ParamDecls {
-		switch p.Kind {
-		case DeclError:
-		case DeclDeclare:
-			if p.Ident == id {
-				return p.Type, true
-			}
-		case DeclAssign:
-			p.Pat.BindTypes(env, p.Type)
-		}
-	}
-	return env.Type(id), false
+	return m.penv.Type(id), m.required[id]
 }
 
 // ParamErr type checks the type environment env against the
@@ -241,67 +343,87 @@ func (m *ModuleImpl) Flags(sess *Session, env *values.Env) (*flag.FlagSet, error
 				help += " "
 			}
 			if m.fenv.Contains(p.Ident) {
-				v := m.fenv.Value(p.Ident)
+				val := m.fenv.Value(p.Ident)
+				v := flagVal{kind: p.Type.Kind, val: val, set: true}
 				switch p.Type.Kind {
-				case types.StringKind:
-					flags.String(p.Ident, v.(string), help)
-				case types.IntKind:
-					flags.Uint64(p.Ident, v.(*big.Int).Uint64(), help)
-				case types.FloatKind:
-					fl, _ := v.(*big.Float).Float64()
-					flags.Float64(p.Ident, fl, help)
-				case types.BoolKind:
-					flags.Bool(p.Ident, v.(bool), help)
+				case types.StringKind, types.IntKind, types.FloatKind, types.BoolKind:
+				case types.FileKind, types.DirKind:
+					// Hack to sneak in flag values as-defined.
+					v.url = m.flags.Lookup(p.Ident).Value.String()
 				default:
-					return nil, fmt.Errorf("-%s: flags of type %s not supported (valid types are: string, int, bool, and float)", p.Ident, p.Type)
+					return nil, fmt.Errorf("-%s: flags of type %s not supported (valid types are: string, int, float, bool, file, dir)", p.Ident, p.Type)
 				}
+				flags.Var(&v, p.Ident, help)
 			} else {
 				if p.Type.Kind != types.BoolKind {
 					help += "(required)"
 				}
+				v := flagVal{kind: p.Type.Kind}
 				switch p.Type.Kind {
-				case types.StringKind:
-					flags.String(p.Ident, "", help)
-				case types.IntKind:
-					flags.Int(p.Ident, 0, help)
-				case types.FloatKind:
-					flags.Float64(p.Ident, 0.0, help)
-				case types.BoolKind:
-					flags.Bool(p.Ident, false, help)
+				case types.StringKind, types.IntKind, types.FloatKind, types.BoolKind, types.FileKind, types.DirKind:
 				default:
-					return nil, fmt.Errorf("-%s: flags of type %s not supported (valid types are: string, int, bool)", p.Ident, p.Type)
+					return nil, fmt.Errorf("-%s: flags of type %s not supported (valid types are: string, int, float, bool, file, dir)", p.Ident, p.Type)
 				}
+				flags.Var(&v, p.Ident, help)
 			}
-			// Assign error values here, so that we get a type error.
-			env.Bind(p.Ident, fmt.Errorf("%s is undefined; flag parameters may not depend on other flag parameters", p.Ident))
+			// Assign error values here, so that we can handle dependent parameters.
+			env.Bind(p.Ident, errParam)
 		case DeclAssign:
 			// In this case, we have a default value in the flag's environment.
 			tenv := types.NewEnv()
-			p.Pat.BindTypes(tenv, p.Type)
-			v, err := p.Expr.eval(sess, env, p.ID(""))
-			if err != nil {
+			p.Pat.BindTypes(tenv, p.Type, types.Never)
+			val, err := p.Expr.eval(sess, env, p.ID(""))
+			_, isFlow := val.(*flow.Flow)
+			dependentParam := err == errParam
+			if err != nil && !dependentParam {
 				return nil, err
 			}
-			for id, match := range p.Pat.Matchers() {
-				w, err := coerceMatch(v, p.Type, p.Pat.Position, match.Path())
+			for _, matcher := range p.Pat.Matchers() {
+				// Create an empty flag value of the flag's type.
+				v := flagVal{kind: p.Type.Kind}
+				// A dependentParam's value cannot be set because it is dependent on the evaluation of another param.
+				// If the param's default value is a flow, do not set its value.
+				if dependentParam || isFlow {
+					flags.Var(&v, matcher.Ident, p.Comment)
+					continue
+				}
+				val, err := coerceMatch(val, p.Type, p.Pat.Position, matcher.Path())
 				if err != nil {
 					return nil, err
 				}
-				if m.fenv.Contains(id) {
-					w = m.fenv.Value(id)
+				if matcher.Ident == "" {
+					continue
 				}
-				// Bind id so we can have parameters depend on each other.
-				env.Bind(id, w)
-				switch tenv.Type(id).Kind {
-				case types.StringKind:
-					flags.String(id, w.(string), p.Comment)
-				case types.IntKind:
-					flags.Uint64(id, w.(*big.Int).Uint64(), p.Comment)
-				case types.FloatKind:
-					f, _ := w.(*big.Float).Float64()
-					flags.Float64(id, f, p.Comment)
-				case types.BoolKind:
-					flags.Bool(id, w.(bool), p.Comment)
+				id := matcher.Ident
+				if m.fenv.Contains(id) {
+					val = m.fenv.Value(id)
+				}
+				// Assign error values here, so that we can handle dependent parameters.
+				env.Bind(id, errParam)
+
+				switch v.kind {
+				case types.StringKind, types.IntKind, types.FloatKind, types.BoolKind:
+					v.val = val
+					v.set = true
+					flags.Var(&v, matcher.Ident, p.Comment)
+				case types.FileKind, types.DirKind:
+					if p.Expr.Kind != ExprApply || p.Expr.Left.Kind != ExprIdent || (p.Expr.Left.Ident != "file" && p.Expr.Left.Ident != "dir") {
+						break
+					}
+					// TODO(marius): dismiss predicates for params that are
+					// themselves not exposed as flags.
+					if !p.Expr.Fields[0].Type.IsConst(nil) {
+						break
+					}
+					// In this case, we can safely evaluate the field (to a string). This string is the file/dir url.
+					url, err := p.Expr.Fields[0].eval(sess, env, p.ID(""))
+					if err != nil {
+						// Impossible for const expressions.
+						panic(err)
+					}
+					v.url = url.(string)
+					v.set = true
+					flags.Var(&v, matcher.Ident, p.Comment)
 				}
 			}
 		}
@@ -309,7 +431,7 @@ func (m *ModuleImpl) Flags(sess *Session, env *values.Env) (*flag.FlagSet, error
 	return flags, nil
 }
 
-// FlagEnv adds flags from the FlagSet to value environment venv and
+// FlagEnv adds all flags from the FlagSet to value environment venv and
 // type environment tenv. The FlagSet should be produced by
 // (*Module).Flags.
 func (m *ModuleImpl) FlagEnv(flags *flag.FlagSet, venv *values.Env, tenv *types.Env) error {
@@ -323,8 +445,10 @@ func (m *ModuleImpl) flagEnv(needMandatory bool, flags *flag.FlagSet, venv *valu
 		if t == nil {
 			return
 		}
-		if f.Value.String() == "" && mandatory {
-			if needMandatory {
+		// fv is always set to be type flagVal
+		fv := f.Value.(*flagVal)
+		if !fv.set {
+			if mandatory && needMandatory {
 				errs = append(errs,
 					fmt.Sprintf("missing mandatory flag -%s", f.Name))
 			}
@@ -351,10 +475,36 @@ func (m *ModuleImpl) flagEnv(needMandatory bool, flags *flag.FlagSet, venv *valu
 			venv.Bind(f.Name, v)
 		case types.BoolKind:
 			venv.Bind(f.Name, f.Value.String() == "true")
+		case types.FileKind, types.DirKind:
+			ident := "file"
+			if t.Kind == types.DirKind {
+				ident = "dir"
+			}
+			e := &Expr{
+				Kind: ExprApply,
+				Left: &Expr{
+					Kind:  ExprIdent,
+					Ident: ident,
+				},
+				Fields: []*FieldExpr{
+					{
+						Expr: &Expr{
+							Kind: ExprLit,
+							Val:  values.T(f.Value.String()),
+						},
+					},
+				},
+			}
+			_, evalvenv := Stdlib()
+			v, err := e.eval(nil, evalvenv, f.Name)
+			if err != nil {
+				panic(err)
+			}
+			venv.Bind(f.Name, v)
 		default:
 			return
 		}
-		tenv.Bind(f.Name, t)
+		tenv.Bind(f.Name, t, scanner.Position{}, types.Never)
 	})
 	switch len(errs) {
 	case 0:
@@ -381,14 +531,22 @@ func (m *ModuleImpl) Make(sess *Session, params *values.Env) (values.T, error) {
 		case DeclDeclare:
 			// value is already bound in params.
 		case DeclAssign:
-			v, err := p.Expr.eval(sess, env, "")
-			if err != nil {
-				return nil, err
-			}
+			var v values.T
 			env = env.Push()
-			for id, m := range p.Pat.Matchers() {
+			for _, m := range p.Pat.Matchers() {
+				if m.Ident == "" {
+					continue
+				}
+				id := m.Ident
 				// Passed parameters override definitions.
 				if !params.Contains(id) {
+					if v == nil {
+						var err error
+						v, err = p.Expr.eval(sess, env, "")
+						if err != nil {
+							return nil, err
+						}
+					}
 					w, err := coerceMatch(v, p.Type, p.Pat.Position, m.Path())
 					if err != nil {
 						return nil, err
@@ -407,12 +565,14 @@ func (m *ModuleImpl) Make(sess *Session, params *values.Env) (values.T, error) {
 			return nil, err
 		}
 		env = env.Push()
-		for id, m := range d.Pat.Matchers() {
+		for _, m := range d.Pat.Matchers() {
 			w, err := coerceMatch(v, d.Type, d.Pat.Position, m.Path())
 			if err != nil {
 				return nil, err
 			}
-			env.Bind(id, w)
+			if m.Ident != "" {
+				env.Bind(m.Ident, w)
+			}
 		}
 	}
 	v := make(values.Module)
@@ -455,7 +615,7 @@ func (m *ModuleImpl) Params() []Param {
 			if m.fenv.Contains(p.Ident) {
 				param.Required = false
 				param.Expr = &Expr{
-					Kind: ExprConst,
+					Kind: ExprLit,
 					Val:  m.fenv.Value(p.Ident),
 					Type: p.Type,
 				}
@@ -471,13 +631,13 @@ func (m *ModuleImpl) Params() []Param {
 					Ident: id,
 					Doc:   p.Comment,
 					Expr: &Expr{
-						Kind: ExprConst,
+						Kind: ExprLit,
 						Val:  m.fenv.Value(id),
 						Type: m.ftenv.Type(id),
 					},
 				})
 			}
-			if len(pat.Matchers()) > 0 {
+			if pat.Kind != PatIgnore {
 				param.Ident = fmt.Sprint(pat)
 				params = append(params, param)
 			}
@@ -492,8 +652,15 @@ func (m *ModuleImpl) Doc(ident string) string {
 }
 
 // Type returns the module type of m.
-func (m *ModuleImpl) Type() *types.T {
-	return m.typ
+func (m *ModuleImpl) Type(penv *types.Env) *types.T {
+	predicates := m.predicates.Copy()
+	for id, t := range penv.Symbols() {
+		if !t.IsConst(nil) {
+			predicates.RemoveAll(m.penv.Type(id).Predicates)
+		}
+	}
+	typ := m.typ.Satisfied(predicates)
+	return typ
 }
 
 // InjectArgs parameterizes the module with the provided flags.
@@ -510,6 +677,7 @@ func (m *ModuleImpl) InjectArgs(sess *Session, args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	m.flags = flags
 	m.fenv = m.fenv.Push()
 	m.ftenv = m.ftenv.Push()
 	m.injectedArgs = args

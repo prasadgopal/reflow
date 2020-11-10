@@ -1,4 +1,4 @@
-// Copyright 2017 GRAIL, Inc. All rights reserved.
+// Copyright 2016 GRAIL, Inc. All rights reserved.
 // Use of this source code is governed by the Apache 2.0
 // license that can be found in the LICENSE file.
 
@@ -30,7 +30,7 @@ import (
 
 // Repository implements a filesystem-backed Repository.
 type Repository struct {
-	// The root directory for htis repository. This directory contains
+	// The root directory for this repository. This directory contains
 	// all objects.
 	Root string
 
@@ -86,6 +86,7 @@ func (r *Repository) InstallDigest(d digest.Digest, file string) error {
 			if ferr != nil {
 				return ferr
 			}
+			defer func() { _ = f.Close() }()
 			_, err = r.Put(context.Background(), f)
 		}
 	}
@@ -110,6 +111,12 @@ func (r *Repository) Get(ctx context.Context, id digest.Digest) (io.ReadCloser, 
 		return nil, errors.E("get", r.Root, id, err)
 	}
 	return rc, nil
+}
+
+// Remove removes an object from the repository.
+func (r *Repository) Remove(id digest.Digest) error {
+	_, path := r.Path(id)
+	return os.Remove(path)
 }
 
 // ReadFrom installs an object directly from a foreign repository. If
@@ -147,7 +154,14 @@ func (r *Repository) ReadFrom(ctx context.Context, id digest.Digest, u *url.URL)
 			if err != nil {
 				return nil, err
 			}
-			return nil, r.InstallDigest(id, temp.Name())
+			f, err := r.Install(temp.Name())
+			if err != nil {
+				return nil, err
+			}
+			if id != f.ID {
+				return nil, errors.E("readfrom", u.String(), errors.Integrity, errors.Errorf("%v != %v", id, f.ID))
+			}
+			return nil, nil
 		}
 
 		rc, err := repo.Get(ctx, id)
@@ -164,6 +178,9 @@ func (r *Repository) ReadFrom(ctx context.Context, id digest.Digest, u *url.URL)
 		}
 		return nil, nil
 	})
+	if err != nil {
+		r.Log.Debug(err)
+	}
 	return err
 }
 
@@ -282,6 +299,18 @@ func (r *Repository) Materialize(root string, binds map[string]digest.Digest) er
 		os.Remove(path) // best effort
 		_, rpath := r.Path(id)
 		if err := os.Link(rpath, path); err != nil {
+			// Copy if file was reported to be on a different device.
+			if linkErr, ok := err.(*os.LinkError); ok && linkErr.Err == syscall.EXDEV {
+				f, ferr := os.Create(path)
+				if ferr != nil {
+					return ferr
+				}
+				rc, rcerr := r.Get(context.Background(), id)
+				if rcerr != nil {
+					return rcerr
+				}
+				_, err = io.Copy(f, rc)
+			}
 			return err
 		}
 	}
@@ -301,10 +330,26 @@ func (r *Repository) Vacuum(ctx context.Context, repo *Repository) error {
 	return w.Err()
 }
 
+// Scan invokes handler for each object in the repository.
+func (r *Repository) Scan(ctx context.Context, handler func(digest.Digest) error) error {
+	var w walker
+	w.Init(r)
+	for w.Scan() {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := handler(w.Digest())
+		if err != nil {
+			return err
+		}
+	}
+	return w.Err()
+}
+
 // CollectWithThreshold removes from this repository any objects not in the
 // Liveset and whose creation times are not more recent than the
 // threshold time.
-func (r *Repository) CollectWithThreshold(ctx context.Context, live liveset.Liveset, threshold time.Time, dryRun bool) error {
+func (r *Repository) CollectWithThreshold(ctx context.Context, live liveset.Liveset, dead liveset.Liveset, threshold time.Time, dryRun bool) error {
 	return errors.E("collectwiththreshold", errors.NotSupported)
 }
 

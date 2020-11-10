@@ -15,12 +15,13 @@ import (
 	"sync"
 	"time"
 
+	"docker.io/go-docker"
+	"docker.io/go-docker/api/types"
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
+	"github.com/grailbio/base/data"
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/blob"
 	"github.com/grailbio/reflow/errors"
@@ -66,7 +67,7 @@ type Pool struct {
 	Prefix string
 	// Client is the Docker client. We assume that the Docker daemon
 	// runs on the same host from which the pool is managed.
-	Client *client.Client
+	Client *docker.Client
 	// Authenticator is used to authenticate ECR image pulls.
 	Authenticator interface {
 		Authenticates(ctx context.Context, image string) (bool, error)
@@ -82,6 +83,8 @@ type Pool struct {
 	Blob blob.Mux
 	// Log
 	Log *log.Logger
+
+	HardMemLimit bool
 
 	mu        sync.Mutex
 	allocs    map[string]*alloc // the set of active allocs
@@ -107,6 +110,21 @@ func (p *Pool) saveState() error {
 	}
 	file.Close()
 	return nil
+}
+
+// detectDiskSize detects the disk resources available on this pool.
+func (p *Pool) detectDiskSize() {
+	root := filepath.Join(p.Prefix, p.Dir)
+	diskSize := 2e12
+	if existing, ok := p.resources["disk"]; ok {
+		diskSize = existing
+	}
+	if usage, err := fs.Stat(root); err == nil {
+		p.resources["disk"] = float64(usage.Total)
+	} else {
+		p.Log.Printf("refresh disk size (assuming %s), stat %s: %v", data.Size(diskSize), root, err)
+		p.resources["disk"] = diskSize
+	}
 }
 
 // Start starts the pool. If the pool has a state snapshot, Start
@@ -135,12 +153,7 @@ func (p *Pool) Start() error {
 	if err := os.MkdirAll(root, 0777); err != nil {
 		log.Printf("mkdir %s: %v", root, err)
 	}
-	if usage, err := fs.Stat(root); err == nil {
-		p.resources["disk"] = float64(usage.Total)
-	} else {
-		log.Printf("stat %s: %v", root, err)
-		p.resources["disk"] = 2e12
-	}
+	p.detectDiskSize()
 
 	if err := os.MkdirAll(filepath.Join(p.Prefix, p.Dir, allocsPath), 0777); err != nil {
 		return err
@@ -202,9 +215,16 @@ func (p *Pool) Start() error {
 	return nil
 }
 
-// available returns the amount of currently available resources:
+func (p *Pool) Resources() reflow.Resources {
+	p.detectDiskSize()
+	var r reflow.Resources
+	r.Set(p.resources)
+	return r
+}
+
+// Available returns the amount of currently available resources:
 // The total less what is occupied by active allocs.
-func (p *Pool) available() reflow.Resources {
+func (p *Pool) Available() reflow.Resources {
 	var reserved reflow.Resources
 	for _, alloc := range p.allocs {
 		if !alloc.expired() {
@@ -212,7 +232,7 @@ func (p *Pool) available() reflow.Resources {
 		}
 	}
 	var avail reflow.Resources
-	avail.Sub(p.resources, reserved)
+	avail.Sub(p.Resources(), reserved)
 	return avail
 }
 
@@ -226,6 +246,7 @@ func (p *Pool) new(ctx context.Context, meta pool.AllocMeta) (pool.Alloc, error)
 		return nil, errors.Errorf("alloc %v: shutting down", meta)
 	}
 	var (
+		total   = p.Resources()
 		used    reflow.Resources
 		expired []*alloc
 	)
@@ -240,10 +261,10 @@ func (p *Pool) new(ctx context.Context, meta pool.AllocMeta) (pool.Alloc, error)
 	collect := expired[:]
 	// TODO: preferentially prefer those allocs which will give us the
 	// resource types we need.
-	p.Log.Printf("alloc total%s used%s want%s", p.resources, used, meta.Want)
+	p.Log.Printf("alloc total%s used%s want%s", total, used, meta.Want)
 	var free reflow.Resources
 	for {
-		free.Sub(p.resources, used)
+		free.Sub(total, used)
 		if free.Available(meta.Want) || len(expired) == 0 {
 			break
 		}
@@ -361,7 +382,7 @@ func (p *Pool) Offers(ctx context.Context) ([]pool.Offer, error) {
 		}
 	}
 	var available reflow.Resources
-	available.Sub(p.resources, reserved)
+	available.Sub(p.Resources(), reserved)
 	if available["mem"] == 0 || available["cpu"] == 0 || available["disk"] == 0 {
 		return nil, nil
 	}
@@ -398,16 +419,31 @@ func (p *Pool) Allocs(ctx context.Context) ([]pool.Alloc, error) {
 }
 
 // StopIfIdle stops the pool if it is idle. Returns whether the pool was stopped.
-func (p *Pool) StopIfIdleFor(d time.Duration) bool {
+// If the pool was not stopped (ie, it was not idle), returns the current max duration
+// to expiry of all allocs in the pool.  Note that further alloc
+// keepalive calls can make the pool unstoppable after the given duration passes.
+func (p *Pool) StopIfIdleFor(d time.Duration) (bool, time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	var (
+		idle            = true
+		maxTimeToExpiry time.Duration
+	)
 	for _, alloc := range p.allocs {
-		if alloc.expiredBy() < d {
-			return false
+		expiredBy := alloc.expiredBy()
+		if expiredBy < d {
+			idle = false
+		}
+		// if alloc isn't expired, expiredBy is negative.
+		if maxTimeToExpiry > expiredBy {
+			maxTimeToExpiry = expiredBy
 		}
 	}
-	p.stopped = true
-	return true
+	if idle {
+		p.stopped = true
+		return true, 0
+	}
+	return false, -maxTimeToExpiry
 }
 
 // Alloc implements a local alloc. It embeds a local executor which
@@ -440,6 +476,7 @@ func (p *Pool) newAlloc(id string, keepalive time.Duration) *alloc {
 		AWSCreds:      p.AWSCreds,
 		Blob:          p.Blob,
 		Log:           p.Log.Tee(nil, id+": "),
+		HardMemLimit:  p.HardMemLimit,
 	}
 
 	// TODO(pgopal) - Get this info from Config.
@@ -552,6 +589,7 @@ func (a *alloc) Keepalive(ctx context.Context, next time.Duration) (time.Duratio
 	a.lastKeepalive = time.Now()
 	a.expires = a.lastKeepalive.Add(next)
 	a.mu.Unlock()
+	a.Log.Printf("keepalive until %s", a.expires.Format(time.RFC3339))
 	return next, nil
 }
 

@@ -26,10 +26,12 @@ func (c *Cmd) list(ctx context.Context, args ...string) {
 
 The columns displayed by list are:
 
+	type    the type of object (eg: offer, alloc, exec)
 	state   the state of an exec
 	memory  the amount of reserved memory
 	cpu     the number of reserved CPUs
 	disk    the amount of reserved disk space
+	expires the alloc's time to expire
 	ident   the exec's identifier, or the alloc's owner
 	uri     the exec's or alloc's URI`
 	)
@@ -39,17 +41,20 @@ The columns displayed by list are:
 	var entries []interface{}
 
 	if len(args) == 0 {
-		allocs, err := cluster.Allocs(ctx)
-		if err != nil {
-			c.Fatal(err)
+		if *allFlag {
+			offers, err := cluster.Offers(ctx)
+			c.must(err)
+			for _, offer := range offers {
+				entries = append(entries, offer)
+			}
 		}
+		allocs, err := cluster.Allocs(ctx)
+		c.must(err)
 		for _, alloc := range allocs {
 			entries = append(entries, alloc)
 			if *allFlag {
 				execs, err := alloc.Execs(ctx)
-				if err != nil {
-					c.Fatal(err)
-				}
+				c.must(err)
 				for _, exec := range execs {
 					entries = append(entries, exec)
 				}
@@ -95,7 +100,6 @@ The columns displayed by list are:
 		}
 		return
 	}
-
 	inspects := make([]interface{}, len(entries))
 	err := traverse.Each(len(entries), func(i int) error {
 		var err error
@@ -104,6 +108,8 @@ The columns displayed by list are:
 			inspects[i], err = entry.Inspect(ctx)
 		case pool.Alloc:
 			inspects[i], err = entry.Inspect(ctx)
+		case pool.Offer:
+			inspects[i] = OfferInspect{entry.ID(), entry.Available()}
 		default:
 			panic("unknown entry type")
 		}
@@ -119,22 +125,28 @@ The columns displayed by list are:
 		// TODO(marius): print creation times here
 		// (these need to be propagated from the alloc).
 		switch inspect := inspects[i].(type) {
+		case OfferInspect:
+			fmt.Fprintf(&tw, "%s\t%s\t%s\t%g\t%s\t%s\t%s\t%s\n",
+				"offer", "",
+				data.Size(inspect.Resources["mem"]),
+				inspect.Resources["cpu"], data.Size(inspect.Resources["disk"]),
+				"", "", inspect.ID)
 		case reflow.ExecInspect:
-			fmt.Fprintf(&tw, "%s\t%s\t%g\t%s\t%s\t%s\n",
-				inspect.State,
+			fmt.Fprintf(&tw, "%s\t%s\t%s\t%g\t%s\t%s\t%s\t%s\n",
+				"exec", inspect.State,
 				data.Size(inspect.Config.Resources["mem"]),
 				inspect.Config.Resources["cpu"], data.Size(inspect.Config.Resources["disk"]),
-				inspect.Config.Ident, sprintURI(entries[i]))
+				"", inspect.Config.Ident, sprintURI(entries[i]))
 		case pool.AllocInspect:
 			expires := time.Until(inspect.Expires)
 			expires = round(expires)
-			fmt.Fprintf(&tw, "%s\t%s\t%g\t%s\t%s\t%s\t%s\n",
-				"", /*TODO(marius): print whether it's active or zombie*/
+			fmt.Fprintf(&tw, "%s\t%s\t%s\t%g\t%s\t%s\t%s\t%s\n",
+				"alloc", "", /*TODO(marius): print whether it's active or zombie*/
 				data.Size(inspect.Resources["mem"]),
 				inspect.Resources["cpu"], data.Size(inspect.Resources["disk"]),
 				expires, inspect.Meta.Owner, sprintURI(entries[i]))
 		default:
-			panic("unknown inspect type")
+			panic("unknown ExecInspect type")
 		}
 	}
 }
@@ -152,4 +164,10 @@ func sprintURI(x interface{}) string {
 	default:
 		panic(fmt.Sprintf("unknown entry type %T", x))
 	}
+}
+
+// OfferInspect contains Offer metadata.
+type OfferInspect struct {
+	ID        string
+	Resources reflow.Resources
 }

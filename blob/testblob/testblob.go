@@ -16,9 +16,9 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/grailbio/base/errors"
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/blob"
+	"github.com/grailbio/reflow/errors"
 )
 
 type store struct {
@@ -47,6 +47,7 @@ func (s *store) Bucket(ctx context.Context, name string) (blob.Bucket, error) {
 		b = &bucket{
 			name:    fmt.Sprintf("%s://%s/", s.scheme, name),
 			objects: make(map[string][]byte),
+			ids:     make(map[string]string),
 		}
 		s.buckets[name] = b
 	}
@@ -57,17 +58,19 @@ type bucket struct {
 	name    string
 	mu      sync.Mutex
 	objects map[string][]byte
+	ids     map[string]string
 }
 
-func (b *bucket) get(key string) ([]byte, bool) {
+func (b *bucket) get(key string) ([]byte, string, bool) {
 	b.mu.Lock()
 	p, ok := b.objects[key]
+	id, _ := b.ids[key]
 	b.mu.Unlock()
-	return p, ok
+	return p, id, ok
 }
 
 func (b *bucket) file(key string) (reflow.File, []byte, bool) {
-	p, ok := b.get(key)
+	p, _, ok := b.get(key)
 	return reflow.File{
 		Size:   int64(len(p)),
 		Source: fmt.Sprintf("%s/%s", b.name, key),
@@ -125,7 +128,7 @@ func (b *bucket) Scan(prefix string) blob.Scanner {
 	return s
 }
 
-func (b *bucket) Download(ctx context.Context, key string, etag string, w io.WriterAt) (int64, error) {
+func (b *bucket) Download(ctx context.Context, key, etag string, size int64, w io.WriterAt) (int64, error) {
 	file, p, ok := b.file(key)
 	if !ok {
 		return -1, errors.E("testblob.Download", b.name, key, errors.NotExist)
@@ -148,13 +151,14 @@ func (b *bucket) Get(ctx context.Context, key string, etag string) (io.ReadClose
 	return ioutil.NopCloser(bytes.NewReader(p)), file, nil
 }
 
-func (b *bucket) Put(ctx context.Context, key string, body io.Reader) error {
+func (b *bucket) Put(ctx context.Context, key string, size int64, body io.Reader, contentHash string) error {
 	p, err := ioutil.ReadAll(body)
 	if err != nil {
 		return err
 	}
 	b.mu.Lock()
 	b.objects[key] = p
+	b.ids[key] = contentHash
 	b.mu.Unlock()
 	return nil
 }
@@ -186,12 +190,28 @@ func (b *bucket) Snapshot(ctx context.Context, prefix string) (reflow.Fileset, e
 	return fs, nil
 }
 
-func (b *bucket) Copy(ctx context.Context, src, dst string) error {
-	p, ok := b.get(src)
+func (b *bucket) Copy(ctx context.Context, src, dst, contentHash string) error {
+	p, id, ok := b.get(src)
 	if !ok {
 		return errors.E("testblob.Copy", b.name, src, dst, errors.NotExist)
 	}
-	return b.Put(ctx, dst, bytes.NewReader(p))
+	if contentHash != "" && id == "" {
+		id = contentHash
+	}
+	return b.Put(ctx, dst, 0, bytes.NewReader(p), id)
+}
+
+func (b *bucket) CopyFrom(ctx context.Context, srcBucket blob.Bucket, src, dst string) error {
+	srcb, ok := srcBucket.(*bucket)
+	if !ok {
+		return errors.E(errors.NotSupported, "testblob.CopyFrom", srcBucket.Location())
+	}
+	p, id, ok := srcb.get(src)
+	if !ok {
+		return errors.E("testblob.Copy", srcBucket.Location(), src, b.name, dst, errors.NotExist)
+	}
+	return b.Put(ctx, dst, 0, bytes.NewReader(p), id)
+
 }
 
 func (b *bucket) Delete(ctx context.Context, keys ...string) error {

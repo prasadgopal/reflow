@@ -5,36 +5,62 @@
 package tool
 
 import (
+	"bytes"
 	"context"
+	"encoding/csv"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"text/template"
 	"time"
 
+	"github.com/grailbio/base/digest"
+	"github.com/grailbio/reflow"
+	"github.com/grailbio/reflow/assoc"
 	"github.com/grailbio/reflow/batch"
 	"github.com/grailbio/reflow/errors"
 	"github.com/grailbio/reflow/flow"
+	"github.com/grailbio/reflow/infra"
+	"github.com/grailbio/reflow/log"
 	"github.com/grailbio/reflow/repository"
 	"github.com/grailbio/reflow/runner"
+	"github.com/grailbio/reflow/sched"
+	"github.com/grailbio/reflow/syntax"
+	"github.com/grailbio/reflow/taskdb"
+	"github.com/grailbio/reflow/types"
 	"github.com/grailbio/reflow/wg"
 )
 
-func (c *Cmd) batchrun(ctx context.Context, args ...string) {
-	c.Fatal("command batchrunb has been renamed runbatch")
+type batchConfig struct {
+	configFilepath string
 }
 
+func (bc *batchConfig) Flags(fs *flag.FlagSet) {
+	fs.StringVar(&bc.configFilepath, "batchconfig", "config.json", "path to the config file (default 'config.json'")
+}
+
+func (bc *batchConfig) Configure(b *batch.Batch) {
+	b.Dir = filepath.Dir(bc.configFilepath)
+	b.ConfigFilename = filepath.Base(bc.configFilepath)
+}
+
+func (c *Cmd) batchrun(ctx context.Context, args ...string) {
+	c.Fatal("command batchrun has been renamed runbatch")
+}
 func (c *Cmd) runbatch(ctx context.Context, args ...string) {
 	flags := flag.NewFlagSet("runbatch", flag.ExitOnError)
 	help := `Runbatch runs the batch defined in this directory.
-	
+
 A batch is defined by a directory with a batch configuration file named
-config.json, which stores a single JSON dictionary with two entries, 
-defining the paths of the reflow program to be used and the run file 
+config.json, which stores a single JSON dictionary with two entries,
+defining the paths of the reflow program to be used and the run file
 that contains each run's parameter. For example, the config.json file
 
 	{
@@ -69,42 +95,23 @@ flags override any parameters in the batch sample file.
 `
 	retryFlag := flags.Bool("retry", false, "retry failed runs")
 	resetFlag := flags.Bool("reset", false, "reset failed runs")
-	gcFlag := flags.Bool("gc", false, "enable runtime garbage collection")
-	nocacheexternFlag := flags.Bool("nocacheextern", false, "don't cache extern ops")
-	recomputeemptyFlag := flags.Bool("recomputeempty", false, "recompute empty cache values")
-	evalStrategy := flags.String("eval", "topdown", "evaluation strategy")
-	invalidateFlag := flags.String("invalidate", "", "regular expression for node identifiers that should be invalidated")
 	idsFlag := flags.String("ids", "", "comma-separated list of ids to run; an empty list runs all")
+	var bc batchConfig
+	bc.Flags(flags)
+	var config CommonRunFlags
+	config.Flags(flags)
 	c.Parse(flags, args, help, "runbatch [-retry] [-reset] [flags]")
 
-	switch *evalStrategy {
-	case "topdown", "bottomup":
-	default:
-		c.Fatalf("invalid evaluation strategy %s", *evalStrategy)
+	if err := config.Err(); err != nil {
+		c.Errorln(err)
+		flags.Usage()
 	}
-	var invalidate func(f *flow.Flow) bool
-	if *invalidateFlag != "" {
-		re, err := regexp.Compile(*invalidateFlag)
-		if err != nil {
-			c.Fatalf("invalid invalidation expression: %v", err)
-		}
-		invalidate = func(f *flow.Flow) bool {
-			return re.MatchString(f.Ident)
-		}
-	}
-	user, err := c.Config.User()
-	if err != nil {
-		c.Fatal(err)
-	}
-	cluster := c.Cluster(c.Status.Group("ec2cluster"))
-	repo, err := c.Config.Repository()
-	if err != nil {
-		c.Fatal(err)
-	}
-	assoc, err := c.Config.Assoc()
-	if err != nil {
-		c.Fatal(err)
-	}
+	var user *infra.User
+	c.must(c.Config.Instance(&user))
+	var repo reflow.Repository
+	c.must(c.Config.Instance(&repo))
+	var assoc assoc.Assoc
+	c.must(c.Config.Instance(&assoc))
 	transferer := &repository.Manager{
 		Status:           c.Status.Group("transfers"),
 		PendingTransfers: repository.NewLimits(c.TransferLimit()),
@@ -118,33 +125,54 @@ flags override any parameters in the batch sample file.
 	if err != nil {
 		c.Log.Error(err)
 	}
-	b := &batch.Batch{
-		EvalConfig: flow.EvalConfig{
-			Log:            c.Log,
-			Snapshotter:    c.blob(),
-			Repository:     repo,
-			Assoc:          assoc,
-			CacheMode:      c.Config.CacheMode(),
-			NoCacheExtern:  *nocacheexternFlag,
-			RecomputeEmpty: *recomputeemptyFlag,
-			Transferer:     transferer,
-			GC:             *gcFlag,
-			BottomUp:       *evalStrategy == "bottomup",
-			Invalidate:     invalidate,
-		},
-		Args:    flags.Args(),
-		Rundir:  c.rundir(),
-		User:    user,
-		Cluster: cluster,
-		Status:  c.Status.Groupf("batch %s", wd),
-	}
-	b.Dir, err = os.Getwd()
+	var cache *infra.CacheProvider
+	c.must(c.Config.Instance(&cache))
+	assg, err := assertionGenerator(c.Config)
 	if err != nil {
 		c.Fatal(err)
 	}
-	if err := b.Init(*resetFlag); err != nil {
+	blobMux, err := blobMux(c.Config)
+	if err != nil {
 		c.Fatal(err)
 	}
+
+	var tdb taskdb.TaskDB
+	err = c.Config.Instance(&tdb)
+	if err != nil {
+		c.Log.Debugf("taskdb: %v", err)
+	}
+
+	var (
+		scheduler             *sched.Scheduler
+		wg                    wg.WaitGroup
+		schedCtx, schedCancel = context.WithCancel(ctx)
+	)
+	if config.Sched {
+		scheduler, err = NewScheduler(schedCtx, c.Config, &wg, nil, nil, c.Status)
+		c.must(err)
+	}
+
+	b := &batch.Batch{
+		EvalConfig: flow.EvalConfig{
+			Log:                c.Log,
+			Snapshotter:        blobMux,
+			Repository:         repo,
+			Assoc:              assoc,
+			AssertionGenerator: assg,
+			CacheMode:          cache.CacheMode,
+			Transferer:         transferer,
+			TaskDB:             tdb,
+			Scheduler:          scheduler,
+		},
+		Args:   flags.Args(),
+		Rundir: c.rundir(),
+		User:   string(*user),
+		Status: c.Status.Groupf("batch %s", wd),
+	}
+	c.must(config.Configure(&b.EvalConfig))
+	bc.Configure(b)
+	c.must(b.Init(*resetFlag, *retryFlag))
+
 	defer b.Close()
 	if *idsFlag != "" {
 		list := strings.Split(*idsFlag, ",")
@@ -158,27 +186,13 @@ flags override any parameters in the batch sample file.
 			}
 		}
 	}
-	if *retryFlag {
-		for id, run := range b.Runs {
-			var retry bool
-			switch run.State.Phase {
-			case runner.Init, runner.Eval:
-				continue
-			case runner.Done, runner.Retry:
-				retry = run.State.Err != nil
-			}
-			if !retry {
-				continue
-			}
-			c.Errorf("retrying run %v\n", id)
-			run.State.Reset()
-		}
-	}
-	var wg wg.WaitGroup
 	ctx, bgcancel := flow.WithBackground(ctx, &wg)
 	err = b.Run(ctx)
 	if err != nil {
 		c.Log.Errorf("batch failed with error %v", err)
+	}
+	if schedCancel != nil {
+		schedCancel()
 	}
 	c.WaitForBackgroundTasks(&wg, 20*time.Minute)
 	bgcancel()
@@ -189,6 +203,8 @@ flags override any parameters in the batch sample file.
 
 func (c *Cmd) batchinfo(ctx context.Context, args ...string) {
 	flags := flag.NewFlagSet("batchinfo", flag.ExitOnError)
+	var bc batchConfig
+	bc.Flags(flags)
 	help := `Batchinfo displays runtime information for the batch in the current directory.
 See runbatch -help for information about Reflow's batching mechanism.`
 	c.Parse(flags, args, help, "batchinfo")
@@ -198,14 +214,8 @@ See runbatch -help for information about Reflow's batching mechanism.`
 
 	var b batch.Batch
 	b.Rundir = c.rundir()
-	var err error
-	b.Dir, err = os.Getwd()
-	if err != nil {
-		c.Fatal(err)
-	}
-	if err := b.Init(false); err != nil {
-		c.Fatal(err)
-	}
+	bc.Configure(&b)
+	c.must(b.ReadState())
 	defer b.Close()
 	ids := make([]string, len(b.Runs))
 	i := 0
@@ -220,14 +230,19 @@ See runbatch -help for information about Reflow's batching mechanism.`
 
 	for _, id := range ids {
 		run := b.Runs[id]
-		fmt.Fprintf(&tw, "run %s: %s\n", id, run.State.ID.Short())
-		c.printRunInfo(ctx, &tw, run.State.ID)
+		if run == nil {
+			continue
+		}
+		fmt.Fprintf(&tw, "run %s: %s\n", id, run.State.ID.IDShort())
+		c.printRunInfo(ctx, &tw, digest.Digest(run.State.ID))
 		fmt.Fprintf(&tw, "\tlog:\t%s\n", filepath.Join(b.Dir, "log."+id))
 	}
 }
 
 func (c *Cmd) listbatch(ctx context.Context, args ...string) {
 	flags := flag.NewFlagSet("listbatch", flag.ExitOnError)
+	var bc batchConfig
+	bc.Flags(flags)
 	help := `Listbatch lists runtime status for the batch in the current directory.
 See runbatch -help for information about Reflow's batching mechanism.
 
@@ -243,14 +258,8 @@ The columns displayed by listbatch are:
 
 	var b batch.Batch
 	b.Rundir = c.rundir()
-	var err error
-	b.Dir, err = os.Getwd()
-	if err != nil {
-		c.Fatal(err)
-	}
-	if err := b.Init(false); err != nil {
-		c.Fatal(err)
-	}
+	bc.Configure(&b)
+	c.must(b.ReadState())
 	defer b.Close()
 	ids := make([]string, len(b.Runs))
 	i := 0
@@ -265,6 +274,9 @@ The columns displayed by listbatch are:
 
 	for _, id := range ids {
 		run := b.Runs[id]
+		if run == nil {
+			continue
+		}
 		var state string
 		switch run.State.Phase {
 		case runner.Init:
@@ -280,6 +292,173 @@ The columns displayed by listbatch are:
 				state = "done"
 			}
 		}
-		fmt.Fprintf(&tw, "%s\t%s\t%s\n", id, run.State.ID.Short(), state)
+		fmt.Fprintf(&tw, "%s\t%s\t%s\n", id, run.State.ID.IDShort(), state)
 	}
+}
+
+type inlineOrFileSystemSourcer map[string][]byte
+
+func (s inlineOrFileSystemSourcer) Source(path string) ([]byte, error) {
+	p, ok := s[path]
+	if !ok {
+		var err error
+		p, err = syntax.Filesystem.Source(path)
+		if err != nil {
+			return nil, fmt.Errorf("module %s: %v", path, err)
+		}
+	}
+	return p, nil
+}
+
+var moduleTemplate = template.Must(template.New("module").Parse(`// This file was automatically generated by {{.user}} at {{.time}}
+//	{{.dir}} $ {{.command}}
+
+// Main computes the batch runs as specificed in the file:
+//	{{.runs}}
+{{$prog := .prog}}val Main = [{{range $_, $entry := .entries }}
+	make({{$prog | printf "%q"}},{{range $key, $value := $entry }}
+		{{$key}} := {{$value}},{{end}}
+	).Main,{{end}}
+]
+`))
+
+func (c *Cmd) genbatch(ctx context.Context, args ...string) {
+	var (
+		flags   = flag.NewFlagSet("genbatch", flag.ExitOnError)
+		bc      batchConfig
+		outFlag = flags.String("o", "", "output module path")
+		help    = `Genbatch generates a single Reflow program that's equivalent to the
+batch configuration present in the working directory from which the
+command is run. (See reflow runbatch -help for details.) Programs
+generates by reflow genbatch should be run with the scalable
+scheduler:
+
+	$ reflow run -sched batch.rf
+`
+	)
+	bc.Flags(flags)
+	c.Parse(flags, args, help, "genbatch [-o module.rf]")
+	cwd, err := os.Getwd()
+	c.must(err)
+	p, err := ioutil.ReadFile(bc.configFilepath)
+	c.must(err)
+	var config struct {
+		Program string `json:"program"`
+		Runs    string `json:"runs_file"`
+	}
+	if err := json.Unmarshal(p, &config); err != nil {
+		log.Fatal(err)
+	}
+	configDir := filepath.Dir(bc.configFilepath)
+	config.Program = filepath.Join(configDir, config.Program)
+	config.Runs = filepath.Join(configDir, config.Runs)
+
+	sess := syntax.NewSession(nil)
+	m, err := sess.Open(config.Program)
+	if err != nil {
+		log.Fatalf("open %s: %v", config.Program, err)
+	}
+
+	params := make(map[string]syntax.Param)
+	for _, p := range m.Params() {
+		params[p.Ident] = p
+	}
+
+	runsPath, err := filepath.Abs(config.Runs)
+	c.must(err)
+	runs, err := os.Open(runsPath)
+	c.must(err)
+	defer runs.Close()
+	r := csv.NewReader(runs)
+	header, err := r.Read()
+	c.must(err)
+	if len(header) < 2 {
+		log.Fatal("expected at least two header fields")
+	}
+	header = header[1:]
+	for _, h := range header {
+		p, ok := params[h]
+		if !ok {
+			log.Fatalf("parameter %s is not defined in module %s", h, config.Program)
+		}
+		switch p.Type.Kind {
+		case types.StringKind, types.IntKind, types.FloatKind, types.BoolKind, types.FileKind, types.DirKind:
+		default:
+			log.Fatalf("parameter %s: unsupported type %s", h, p.Type)
+		}
+	}
+
+	var entries []map[string]string
+	for nline := 0; ; nline++ {
+		record, err := r.Read()
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			log.Fatal(err)
+		}
+		if len(record) != len(header)+1 {
+			log.Fatalf("%s:%d: length of record (%d) does not match length of header (%d)",
+				config.Runs, nline, len(record), len(header))
+		}
+		record = record[1:]
+		entry := make(map[string]string)
+		for i, h := range header {
+			p := params[h]
+			switch p.Type.Kind {
+			case types.StringKind:
+				entry[h] = fmt.Sprintf("%q", record[i])
+			case types.IntKind, types.FloatKind, types.BoolKind:
+				entry[h] = record[i]
+			case types.FileKind:
+				entry[h] = fmt.Sprintf("file(%q)", record[i])
+			case types.DirKind:
+				entry[h] = fmt.Sprintf("dir(%q)", record[i])
+			default:
+				panic(h)
+			}
+		}
+		entries = append(entries, entry)
+	}
+
+	var b bytes.Buffer
+	err = moduleTemplate.Execute(&b, map[string]interface{}{
+		"entries": entries,
+		"prog":    config.Program,
+		"user":    os.Getenv("USER"),
+		"time":    time.Now().Local().Format(time.RFC822),
+		"dir":     cwd,
+		"command": strings.Join(os.Args, " "),
+		"runs":    runsPath,
+	})
+	c.must(err)
+
+	// Perform a typecheck to ensure that the program is well-formed.
+	prog, err := ioutil.ReadFile(config.Program)
+	c.must(err)
+	sess = syntax.NewSession(inlineOrFileSystemSourcer{
+		"<stdout>.rf":  b.Bytes(),
+		config.Program: prog,
+	})
+	if _, err = sess.Open("<stdout>.rf"); err != nil {
+		if _, err := io.Copy(os.Stdout, &b); err != nil {
+			log.Fatal(err)
+		}
+		log.Fatalf("invalid batch: %v", err)
+	}
+
+	if *outFlag != "" {
+		f, err := os.Create(*outFlag)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if _, err := io.Copy(f, &b); err != nil {
+			log.Fatal(err)
+		}
+		c.must(f.Close())
+	} else {
+		if _, err := io.Copy(os.Stdout, &b); err != nil {
+			log.Fatal(err)
+		}
+	}
+
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/flow"
 	op "github.com/grailbio/reflow/test/flow"
+	"github.com/grailbio/reflow/test/testutil"
 )
 
 func mustParseURL(s string) *url.URL {
@@ -56,23 +57,38 @@ func TestCanonicalize(t *testing.T) {
 	if canon.Deps[0] != canon.Deps[1] {
 		t.Fatal("flow is not canonical")
 	}
+	// make sure forced intern doesn't canonicalize to unforced ones.
+	intern3 := op.Intern("url")
+	intern3.MustIntern = true
+	merged = op.Merge(intern1, intern3)
+	d1 := merged.Digest()
+	canon = merged.Canonicalize(flow.Config{})
+	if got, want := canon.Digest(), d1; got != want {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	if canon.Deps[0] == canon.Deps[1] {
+		t.Fatalf("intern and forced intern should not canonical, %v, %v", canon.Deps[0].DebugString(), canon.Deps[1].DebugString())
+	}
+	if d != d1 {
+		t.Fatal("flow digests should be identical")
+	}
 }
 
 func TestPhysicalDigests(t *testing.T) {
 	e1 := op.Exec("image", "cmd1", reflow.Resources{"mem": 10, "cpu": 1, "disk": 110})
-	n := len(e1.PhysicalDigests())
+	n := len(flow.PhysicalDigests(e1))
 	if n != 1 {
 		t.Errorf("expected 1 physical digest; got %d", n)
 	}
 
 	e1.OriginalImage = "image"
-	n = len(e1.PhysicalDigests())
+	n = len(flow.PhysicalDigests(e1))
 	if n != 1 {
 		t.Errorf("expected 1 physical digest; got %d", n)
 	}
 
 	e1.OriginalImage = "origImage"
-	n = len(e1.PhysicalDigests())
+	n = len(flow.PhysicalDigests(e1))
 	if n != 2 {
 		t.Errorf("expected 2 physical digests; got %d", n)
 	}
@@ -109,10 +125,79 @@ func TestFlowRequirements(t *testing.T) {
 		return op.Exec("image", "command", reflow.Resources{}, f)
 	}, merge)
 	req = mapflow.Requirements()
-	if !req.Wide() {
+	if req.Width != 1 {
 		t.Errorf("expected wide, got %v", req)
 	}
 	if got, want := req.Min, (reflow.Resources{"mem": 20, "cpu": 1, "disk": 110}); !got.Equal(want) {
 		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestDepAssertions(t *testing.T) {
+	fuzz := testutil.NewFuzz(nil)
+	i1, i1Fs := op.Intern("url"), fuzz.Fileset(true, true)
+	i1.Value = i1Fs
+	i1A, _ := reflow.MergeAssertions(i1Fs.Assertions()...)
+	i2, i2Fs := op.Intern("url"), fuzz.Fileset(true, true)
+	i2.Value = i2Fs
+	i2A, _ := reflow.MergeAssertions(i2Fs.Assertions()...)
+	mInterns := op.Merge(i1, i2)
+
+	e1, e1Fs := op.Exec("image", "cmd1", reflow.Resources{"mem": 10, "cpu": 1, "disk": 110}, i1), fuzz.Fileset(true, true)
+	e1.Value = e1Fs
+	e1A, _ := reflow.MergeAssertions(e1Fs.Assertions()...)
+	e2, e2Fs := op.Exec("image", "cmd2", reflow.Resources{"mem": 20, "cpu": 1, "disk": 100}, i2), fuzz.Fileset(true, true)
+	e2.Value = e2Fs
+	e2A, _ := reflow.MergeAssertions(e2Fs.Assertions()...)
+	ex1 := op.Extern("externurl", e1)
+	ex2 := op.Extern("externurl", e2)
+	mExecs := op.Merge(e1, e2)
+	exM := op.Extern("externurl", mExecs)
+
+	tests := []struct {
+		f    *flow.Flow
+		want *reflow.Assertions
+		we   bool
+	}{
+		{i1, nil, false}, {i2, nil, false}, {mInterns, nil, false},
+		{e1, i1A, false}, {e2, i2A, false}, {mExecs, nil, false},
+		{ex1, e1A, false}, {ex2, e2A, false}, {exM, nil, false},
+	}
+	for _, tt := range tests {
+		got, gotE := reflow.MergeAssertions(flow.DepAssertions(tt.f)...)
+		if tt.we != (gotE != nil) {
+			t.Errorf("(%v).depAssertions() got %v, want error: %v ", tt.f, gotE, tt.we)
+		}
+		if tt.we {
+			continue
+		}
+		if !got.Equal(tt.want) {
+			t.Errorf("got %v, want %v", got, tt.want)
+		}
+	}
+}
+
+func TestImageQualifiers(t *testing.T) {
+	tests := []struct {
+		img, wImg     string
+		wAws, wDocker bool
+	}{
+		{"someimg", "someimg", false, false},
+		{"someimg$aws", "someimg", true, false},
+		{"someimg$docker", "someimg", false, true},
+		{"someimg$aws$docker", "someimg", true, true},
+		{"someimg$docker$aws", "someimg", true, true},
+	}
+	for _, tt := range tests {
+		got, gotaws, gotdocker := flow.ImageQualifiers(tt.img)
+		if got != tt.wImg {
+			t.Errorf("got %v, want %v", got, tt.wImg)
+		}
+		if gotaws != tt.wAws {
+			t.Errorf("got %v, want %v", gotaws, tt.wAws)
+		}
+		if gotdocker != tt.wDocker {
+			t.Errorf("got %v, want %v", gotdocker, tt.wDocker)
+		}
 	}
 }

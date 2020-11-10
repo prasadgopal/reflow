@@ -3,7 +3,7 @@ package syntax
 
 import (
 	"fmt"
-	
+
 	"github.com/grailbio/reflow/internal/scanner"
 	"github.com/grailbio/reflow/types"
 )
@@ -42,6 +42,8 @@ type typearg struct {
 	decllist []*Decl
 	pat *Pat
 	patlist []*Pat
+	caseclause *CaseClause
+	caseclauses []*CaseClause
 	tok int
 	template *Template
 	
@@ -54,9 +56,17 @@ type typearg struct {
 		field string
 		pat *Pat
 	}
+
+	listpats struct{
+		list []*Pat
+		tail *Pat
+	}
 	
 	typearg typearg
 	typeargs []typearg
+
+	variant *types.Variant
+	variants []*types.Variant
 	
 	module *ModuleImpl
 	
@@ -70,19 +80,23 @@ type typearg struct {
 %token	<template>	tokTemplate
 %token	<pos>	tokFile tokDir tokStruct tokModule tokExec tokAs  tokAt
 %token	<pos>	tokVal tokFunc tokAssign tokArrow tokLeftArrow tokIf tokElse 
-%token	<pos>	tokMake tokLen  tokPanic tokDelay tokTrace tokMap tokList tokZip tokUnzip tokFlatten
-%token	<pos>	tokStartModule tokStartDecls tokStartExpr tokStartType
-%token	<pos>	tokKeyspace tokParam  tokEllipsis  tokReserved  tokRequires tokRange
+%token	<pos>	tokSwitch tokCase
+%token	<pos>	tokMake
+%token	<pos>	tokStartModule tokStartDecls tokStartExpr tokStartType tokStartPat
+%token	<pos>	tokKeyspace tokParam  tokEllipsis  tokReserved  tokRequires
 %token	<pos>	tokType
 %token	<pos>	'{' '(' '['
 %token	<pos>	tokOrOr tokAndAnd tokLE tokGE  tokNE tokEqEq tokLSH tokRSH
 %token	<pos>	tokSquiggleArrow
-%token	<pos>	'<' '>' '+' '-' '|' '^'  '*' '/' '%' '&' '_' '!'
+%token	<pos>	'<' '>' '+' '-' '|' '^'  '*' '/' '%' '&' '_' '!' '#'
 %token	tokEOF tokError 
 
 %type	<decllist>		defs defs1 commadefs  paramdef paramdefs 
 %type	<decl>		val valdef typedef def  commadef
 %type	<expr>		expr  term  keyspace exprblock ifelseblock elseifexpr
+%type	<expr>		switchexpr caseexpr caseexprblock
+%type	<caseclauses>	caseclauses
+%type	<caseclause>	caseclause
 %type	<exprlist>	 listargs  listappendargs
 %type	<exprmap>	mapargs
 %type	<comprclauses>	comprclauses
@@ -93,16 +107,19 @@ type typearg struct {
 %type	<typeargs>	typearglist
 %type	<typfields>	typeargs
 %type	<typfields>	typefields  typefield   funcargs
+%type	<variant> variant
+%type	<variants> variants
 %type	<idents>		typefieldidents
 %type	<posidents>	idents
 %type	<exprfield>	structfieldarg
 %type	<exprfields>	structfieldargs applyargs tupleargs
 %type	<module>	module
 %type	<decllist>	params param 
-%type	<pat>		pat 
+%type	<pat>		pat listpattail
 %type	<structpat>	structpat
 %type 	<structpats>	structpatargs
-%type	<patlist>		tuplepatargs listpatargs 
+%type	<patlist>		tuplepatargs patlist
+%type	<listpats>	listpatargs
 
 // Precedence as in Go.
 
@@ -115,7 +132,7 @@ type typearg struct {
 %left '+' '-' '|' '^'
 %left '*' '/' '%' '&' tokLSH tokRSH
 %left unary
-%right '.' '[' ']' '(' ')'
+%right '.' '[' ']' '(' ')' '{' '}'
 %nonassoc apply
 %left deref
 
@@ -140,6 +157,11 @@ start:
 |	tokStartType type tokEOF
 	{
 		yylex.(*Parser).Type = $2
+		return 0
+	}
+|	tokStartPat pat tokEOF
+	{
+		yylex.(*Parser).Pat = $2
 		return 0
 	}
 
@@ -182,6 +204,20 @@ type:
 	}
 |	tokFunc '(' typeargs ')' type
 	{$$ = types.Func($5, $3...)}
+|	variants
+	{$$ = types.Sum($1...)}
+
+variants:
+	variant
+	{$$ = []*types.Variant{$1}}
+|	variants '|' variant
+	{$$ = append($1, $3)}
+
+variant:
+	'#' tokIdent '(' type ')'
+	{$$ = &types.Variant{Tag: $2.Ident, Elem: $4}}
+|	'#' tokIdent %prec first
+	{$$ = &types.Variant{Tag: $2.Ident}}
 
 typefieldidents:
 	tokIdent
@@ -270,7 +306,7 @@ pat:
 |	'(' tuplepatargs ')'
 	{$$ = &Pat{Position: $1.Position, Kind: PatTuple, List: $2}}
 |	'[' listpatargs ']'
-	{$$ = &Pat{Position: $1.Position, Kind: PatList, List: $2}}
+	{$$ = &Pat{Position: $1.Position, Kind: PatList, List: $2.list, Tail: $2.tail}}
 |	'{' structpatargs '}'
 	{
 		$$ = &Pat{Position: $1.Position, Kind: PatStruct, Fields: make([]PatField, len($2))}
@@ -278,14 +314,41 @@ pat:
 			$$.Fields[i] = PatField{p.field, p.pat}
 		}
 	}
+|	'#' tokIdent %prec first
+	{$$ = &Pat{Position: $1.Position, Kind: PatVariant, Tag: $2.Ident}}
+|	'#' tokIdent '(' pat ')'
+	{$$ = &Pat{Position: $1.Position, Kind: PatVariant, Tag: $2.Ident, Elem: $4}}
 
 listpatargs:
-	tuplepatargs		// at the moment, they are the same
+	patlist
+	{$$ = struct{
+		list []*Pat
+		tail *Pat
+	}{
+		list: $1,
+	}}
+|	patlist ',' listpattail
+	{$$ = struct{
+		list []*Pat
+		tail *Pat
+	}{
+		list: $1,
+		tail: $3,
+	}}
+
+listpattail:
+	tokEllipsis
+	{$$ = &Pat{Position: $1.Position, Kind: PatIgnore}}
+|	tokEllipsis pat
+	{$$ = $2}
 
 tuplepatargs:
+	patlist
+
+patlist:
 	pat
 	{$$ = []*Pat{$1}}
-|	tuplepatargs ',' pat
+|	patlist ',' pat
 	{$$ = append($1, $3)}
 
 structpatargs:
@@ -335,7 +398,7 @@ commadef: def
 		$$ = &Decl{
 			Position: $1.Position, 
 			Comment: $1.Comment, 
-			Pat: &Pat{Kind: PatIdent, Ident: $1.Ident}, 
+			Pat: &Pat{Position: $1.Position, Kind: PatIdent, Ident: $1.Ident}, 
 			Kind: DeclAssign, 
 			Expr: &Expr{Kind: ExprIdent, Ident: $1.Ident},
 		}
@@ -360,14 +423,14 @@ valdef:
 		$$.Comment = $1.comment
 	}
 |	tokIdent tokAssign expr
-	{$$ = &Decl{Position: $1.Position, Comment: $1.Comment, Pat: &Pat{Kind: PatIdent, Ident: $1.Ident}, Kind: DeclAssign, Expr: $3}}
+	{$$ = &Decl{Position: $1.Position, Comment: $1.Comment, Pat: &Pat{Position: $1.Position, Kind: PatIdent, Ident: $1.Ident}, Kind: DeclAssign, Expr: $3}}
 |	tokFunc tokIdent '(' funcargs ')' '=' expr
-	{$$ = &Decl{Position: $1.Position, Comment: $1.comment, Pat: &Pat{Kind: PatIdent, Ident: $2.Ident}, Kind: DeclAssign, Expr: &Expr{
+	{$$ = &Decl{Position: $1.Position, Comment: $1.comment, Pat: &Pat{Position: $1.Position, Kind: PatIdent, Ident: $2.Ident}, Kind: DeclAssign, Expr: &Expr{
 		Kind: ExprFunc,
 		Args: $4,
 		Left: $7}}}
 |	tokFunc tokIdent '(' funcargs ')' type '=' expr
-	{$$ = &Decl{Position: $1.Position, Comment: $1.comment, Pat: &Pat{Kind: PatIdent, Ident: $2.Ident}, Kind: DeclAssign, Expr: &Expr{
+	{$$ = &Decl{Position: $1.Position, Comment: $1.comment, Pat: &Pat{Position: $1.Position, Kind: PatIdent, Ident: $2.Ident}, Kind: DeclAssign, Expr: &Expr{
 		Position: $1.Position,
 		Kind: ExprAscribe,
 		Type: types.Func($6, $4...),
@@ -414,7 +477,7 @@ paramdef:
 		if len($1.idents) != 1 {
 			$$ = []*Decl{{Kind: DeclError}}
 		} else {
-			$$ = []*Decl{{Position: $1.pos, Comment: $1.comments[0], Pat: &Pat{Kind: PatIdent, Ident: $1.idents[0]}, Kind: DeclAssign, Expr: $3}}
+			$$ = []*Decl{{Position: $1.pos, Comment: $1.comments[0], Pat: &Pat{Position: $1.pos, Kind: PatIdent, Ident: $1.idents[0]}, Kind: DeclAssign, Expr: $3}}
 		}
 	}
 |	idents type '=' expr 
@@ -425,7 +488,7 @@ paramdef:
 			$$ = []*Decl{{
 				Position: $1.pos, 
 				Comment: $1.comments[0],
-				Pat: &Pat{Kind: PatIdent, Ident: $1.idents[0]}, 
+				Pat: &Pat{Position: $1.pos, Kind: PatIdent, Ident: $1.idents[0]}, 
 				Kind: DeclAssign, 
 				Expr: &Expr{Kind: ExprAscribe, Position: $1.pos, Type: $2, Left: $4},
 			}}
@@ -477,6 +540,7 @@ expr: term
 	{$$ = &Expr{Position: $1.Position, Kind: ExprBinop, Op: "~>", Left: $1, Right: $3}}
 |	tokIf expr ifelseblock elseifexpr
 	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprCond, Cond: $2, Left: $3, Right: $4}}
+|	switchexpr
 |	expr '[' expr ']'
 	{$$ = &Expr{Position: $1.Position, Kind: ExprIndex, Left: $1, Right: $3}}
 |	expr '(' applyargs commaOk ')'  
@@ -547,33 +611,17 @@ term:
 			ComprClauses: $4,
 		}
 	}
+|	'#' tokIdent %prec first
+	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprVariant, Ident: $2.Ident}}
+|	'#' tokIdent '(' expr ')'
+	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprVariant, Ident: $2.Ident, Left: $4}}
 |	'(' expr ')'
 	{$$ = $2}
 |	exprblock
-|	tokLen '(' expr ')'
-	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprBuiltin, Op: "len", Left: $3}}
 |       tokInt '(' expr ')'
-	{$$ = &Expr{Position: $1.Position, Comment: $1.Comment, Kind: ExprBuiltin, Op: "int", Left: $3}}
+	{$$ = &Expr{Position: $1.Position, Comment: $1.Comment, Kind: ExprBuiltin, Op: "int", Fields: []*FieldExpr{{Expr:$3}}}}
 |       tokFloat '(' expr ')'
-	{$$ = &Expr{Position: $1.Position, Comment: $1.Comment, Kind: ExprBuiltin, Op: "float", Left: $3}}
-|	tokZip '(' expr ',' expr ')'
-	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprBuiltin, Op: "zip", Left: $3, Right: $5}}
-|	tokUnzip '(' expr ')'
-	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprBuiltin, Op: "unzip", Left: $3}}
-|	tokFlatten '(' expr ')'
-	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprBuiltin, Op: "flatten", Left: $3}}
-|	tokMap '(' expr ')'
-	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprBuiltin, Op: "map", Left: $3}}
-|	tokRange '(' expr ',' expr ')'
-	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprBuiltin, Op: "range", Left: $3, Right: $5}}
-|	tokList '(' expr ')'
-	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprBuiltin, Op: "list", Left: $3}}
-|	tokDelay '(' expr ')'
-	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprBuiltin, Op: "delay", Left: $3}}
-|	tokPanic '(' expr ')'
-	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprBuiltin, Op: "panic", Left: $3}}
-|	tokTrace '(' expr ')'
-	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprBuiltin, Op: "trace", Left: $3}}
+	{$$ = &Expr{Position: $1.Position, Comment: $1.Comment, Kind: ExprBuiltin, Op: "float", Fields: []*FieldExpr{{Expr:$3}}}}
 
 exprblock:
 	'{' defs1 expr maybeColon'}'
@@ -582,7 +630,26 @@ exprblock:
 ifelseblock:
 	'{' defs expr maybeColon '}'
 	{$$ = &Expr{Position: $1.Position, Comment: $1.comment,  Kind: ExprBlock, Decls: $2, Left: $3}}
-	
+
+switchexpr:
+	tokSwitch expr '{' caseclauses '}'
+	{$$ = &Expr{Position: $1.Position, Comment: $1.comment, Kind: ExprSwitch, Left: $2, CaseClauses: $4}}
+
+caseclauses:
+	{$$ = nil}
+|	caseclauses caseclause
+	{$$ = append($1, $2)}
+
+caseclause:
+	tokCase pat ':' caseexpr maybeColon
+	{$$ = &CaseClause{Position: $1.Position, Comment: $1.comment, Pat: $2, Expr: $4}}
+
+caseexpr: expr | caseexprblock
+
+caseexprblock:
+	defs1 expr
+	{$$ = &Expr{Kind: ExprBlock, Decls: $1, Left: $2}}
+
 comprclauses:
 	comprclause
 	{$$ = []*ComprClause{$1}}

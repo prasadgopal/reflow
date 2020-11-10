@@ -16,6 +16,26 @@ import (
 	"github.com/grailbio/reflow/values"
 )
 
+func init() {
+	builtins = map[string]bool{
+		"delay":   true,
+		"fold":    true,
+		"flatten": true,
+		"len":     true,
+		"list":    true,
+		"map":     true,
+		"panic":   true,
+		"range":   true,
+		"reduce":  true,
+		"trace":   true,
+		"unzip":   true,
+		"zip":     true,
+	}
+}
+
+// Builtins is the list of builtin function names.
+var builtins map[string]bool
+
 // ExprKind is the kind of an expression.
 type ExprKind int
 
@@ -30,8 +50,8 @@ const (
 	ExprUnop
 	// ExprApply is function application.
 	ExprApply
-	// ExprConst is a const (literal).
-	ExprConst
+	// ExprLit is a literal value.
+	ExprLit
 	// ExprAscribe is an ascription (static type assertion).
 	ExprAscribe
 	// ExprBlock is a declaration-block.
@@ -46,10 +66,14 @@ const (
 	ExprList
 	// ExprMap is a map literal.
 	ExprMap
+	// ExprVariant is a variant construction expression.
+	ExprVariant
 	// ExprExec is an exec expression.
 	ExprExec
 	// ExprCond is a conditional expression.
 	ExprCond
+	// ExprSwitch is a switch expression.
+	ExprSwitch
 	// ExprDeref is a struct derefence expression.
 	ExprDeref
 	// ExprIndex is an indexing (map or list) expression.
@@ -171,26 +195,39 @@ type Expr struct {
 	// Decls holds declarations for ExprBlock and ExprExec.
 	Decls []*Decl
 
+	// CaseClauses holds the case clauses for ExprSwitch.
+	CaseClauses []*CaseClause
+
 	// Fields holds field definitions (identifiers and expressions)
 	// in ExprStruct, ExprTuple
 	Fields []*FieldExpr
 
-	// Ident stores the identifier for ExprIdent
+	// Ident stores the identifier for ExprIdent or tag for ExprVariant
 	Ident string
 
-	// Val stores constant values in ExprConst.
+	// Val stores constant values in ExprLit.
 	Val values.T
 
-	// Type holds the Type in ExprAscribe, ExprExec, and ExprConst.
+	// Type holds the Type in ExprAscribe, ExprExec, and ExprLit.
 	Type *types.T
 
 	// Template is the exec template in ExprExec.
 	Template *Template
 
+	// Image is the (evaluated) image string used in the exec.
+	// It is populated during evaluation.
+	// NOTE: The image field isn't a constant in an exec expression. This is solely present here to maintain
+	// backwards compatibility with existing digests (digest1). Otherwise this field should NOT be used in any other
+	// contexts as it can be set to an incorrect value.
+	image string
+
+	// NonDeterministic defines whether the exec in ExprExec is non-deterministic.
+	NonDeterministic bool
+
 	ComprExpr    *Expr
 	ComprClauses []*ComprClause
 
-	// Env stores a value environmetn for ExprThunk.
+	// Env stores a value environment for ExprThunk.
 	Env *values.Env
 
 	// Pat stores the bind pattern in a comprehension.
@@ -198,17 +235,6 @@ type Expr struct {
 
 	// Module stores the module as opened during type checking.
 	Module Module
-}
-
-// ExprValue stores the evaluated values associated with the dependencies
-// of an Expr node. It is used while evaluating an expression tree.
-type ExprValue struct {
-	Left, Right values.T
-	Cond        values.T
-	List        []values.T
-	Map         []struct{ K, V *values.T }
-	Fields      []values.T
-	Extras      []values.T
 }
 
 // Subexpr returns a slice of this expression's dependencies.
@@ -258,6 +284,9 @@ func (e *Expr) err() error {
 	for _, sub := range e.Subexpr() {
 		el = el.Append(sub.err())
 	}
+	for _, clause := range e.CaseClauses {
+		el = el.Append(clause.Expr.err())
+	}
 	for _, clause := range e.ComprClauses {
 		if clause.Expr != nil {
 			el = el.Append(clause.Expr.err())
@@ -268,7 +297,12 @@ func (e *Expr) err() error {
 	}
 	// Suppress consequent errors.
 	if len(el) == 0 && e.Type != nil && e.Type.Error != nil {
-		el = el.Error(e.Position, e.Type.Error)
+		switch e.Type.Error.(type) {
+		case posError, posErrors:
+			el = el.Append(e.Type.Error)
+		default:
+			el = el.Error(e.Position, e.Type.Error)
+		}
 	}
 	return el.Make()
 }
@@ -288,34 +322,69 @@ func comparable(t *types.T) bool {
 			}
 		}
 		return true
+	case types.SumKind:
+		for _, variant := range t.Variants {
+			if variant.Elem == nil {
+				continue
+			}
+			if !comparable(variant.Elem) {
+				return false
+			}
+		}
+		return true
 	}
 	return false
+}
+
+func (e *Expr) resolve(sess *Session, env *types.Env) {
+	switch e.Kind {
+	case ExprApply:
+		if e.Left.Kind != ExprIdent {
+			return
+		}
+		typ := env.Type(e.Left.Ident)
+		if typ != nil {
+			return
+		}
+		ok := builtins[e.Left.Ident]
+		if !ok {
+			return
+		}
+		e.Kind = ExprBuiltin
+		e.Op = e.Left.Ident
+		// Nuke the error from the ExprIdent resolution failure.
+		e.Left.Type = nil
+	}
 }
 
 func (e *Expr) init(sess *Session, env *types.Env) {
 	switch e.Kind {
 	case ExprBlock:
 		env = env.Push()
+		defer reportUnused(sess, env)
 		for _, d := range e.Decls {
 			d.Init(sess, env)
 			if d.Type.Kind == types.ErrorKind {
-				e.Type = d.Type.Derive(nil)
-			} else if err := d.Pat.BindTypes(env, d.Type); err != nil {
+				e.Type = d.Type
+			} else if err := d.Pat.BindTypes(env, types.Swizzle(d.Type, types.NotConst), types.Always); err != nil {
 				d.Type = types.Error(err)
 			}
 		}
 	case ExprFunc:
 		env = env.Push()
+		defer reportUnused(sess, env)
 		for i := range e.Args {
 			e.Args[i].T = expand(e.Args[i].T, env)
 		}
 		for _, a := range e.Args {
-			env.Bind(a.Name, a.T)
+			env.Bind(a.Name, a.T, e.Position, types.Never)
 		}
 	}
+
 	for _, sub := range e.Subexpr() {
 		sub.init(sess, env)
 	}
+	e.resolve(sess, env)
 	// Expand out all aliases in this expr's type. Type inference cannot
 	// introduce aliases, so we're fine (and it's simpler) to do it
 	// before then.
@@ -333,27 +402,26 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 		if e.Type == nil {
 			e.Type = types.Errorf("identifier %q not defined", e.Ident)
 		}
+		env.Use(e.Ident)
 	case ExprBinop:
 		if e.Op == "~>" {
-			e.Type = e.Right.Type.Derive(e.Left.Type)
+			e.Type = types.Swizzle(e.Right.Type, types.NotConst, e.Left.Type)
 			return
 		}
-		if e.Op == "+" && (e.Left.Type.Kind == types.ListKind || e.Left.Type.Kind == types.MapKind) {
-			e.Type = e.Left.Type.Unify(e.Right.Type)
+		if e.Op == "+" && (e.Left.Type.Kind == types.ListKind || e.Left.Type.Kind == types.MapKind || e.Left.Type.Kind == types.DirKind) {
+			e.Type = types.Unify(types.Const, e.Left.Type, e.Right.Type)
 			return
 		}
-
 		if !e.Left.Type.Equal(e.Right.Type) {
 			e.Type = types.Errorf(
 				"cannot apply binary operator %q to type %v and %v",
 				e.Op, e.Left.Type, e.Right.Type)
 			return
 		}
-		unified := e.Left.Type.Unify(e.Right.Type)
+		unified := types.Unify(types.Const, e.Left.Type, e.Right.Type)
 		switch e.Op {
 		case "+":
 			switch e.Left.Type.Kind {
-			// TODO(marius): for maps and lists, we should unify here.
 			case types.StringKind, types.IntKind, types.FloatKind:
 				e.Type = unified
 			default:
@@ -375,20 +443,20 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 			}
 		case "&&", "||":
 			if e.Left.Type.Kind == types.BoolKind {
-				e.Type = types.Bool.Derive(unified)
+				e.Type = types.Swizzle(types.Bool.Const(), types.Const, unified)
 			} else {
 				e.Type = types.Errorf("binary operator %q not allowed for type %v", e.Op, e.Left.Type)
 			}
 		case "==", "!=":
 			if comparable(e.Left.Type) {
-				e.Type = types.Bool.Derive(unified)
+				e.Type = types.Swizzle(types.Bool.Const(), types.Const, unified)
 			} else {
 				e.Type = types.Errorf("cannot compare values of type %v", e.Left.Type)
 			}
 		case ">", "<", "<=", ">=":
 			switch e.Left.Type.Kind {
 			case types.StringKind, types.IntKind, types.FloatKind:
-				e.Type = types.Bool.Derive(unified)
+				e.Type = types.Swizzle(types.Bool.Const(), types.Const, unified)
 			default:
 				e.Type = types.Errorf("cannot compare values of type %v", e.Left.Type)
 			}
@@ -403,7 +471,7 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 			if e.Left.Type.Kind != types.BoolKind {
 				e.Type = types.Errorf("unary operator \"!\" is only valid for bools, not %s", e.Left.Type)
 			} else {
-				e.Type = types.Bool.Derive(e.Left.Type)
+				e.Type = types.Swizzle(types.Bool.Const(), types.Const, e.Left.Type)
 			}
 		case "-":
 			switch e.Left.Type.Kind {
@@ -438,7 +506,8 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 				e.Left.identOr("function"), types.FieldsString(have), types.FieldsString(e.Left.Type.Fields))
 			return
 		}
-		e.Type = e.Left.Type.Elem.Derive(e.Left.Type)
+		typs := make([]*types.T, 1+len(e.Fields))
+		typs[0] = e.Left.Type
 		for i, f := range e.Fields {
 			if !f.Type.Sub(e.Left.Type.Fields[i].T) {
 				e.Type = types.Errorf(
@@ -446,41 +515,43 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 					f.Type, e.Left.Type.Fields[i].T, e.Left.identOr("function"), e.Left.Type)
 				return
 			}
-			e.Type = e.Type.Derive(f.Type)
+			typs[i+1] = f.Type
 		}
+		e.Type = types.Swizzle(e.Left.Type.Elem, types.NotConst, typs...)
 		return
-	case ExprConst:
+	case ExprLit:
+		e.Type = e.Type.Const()
 	case ExprAscribe:
 		if !e.Left.Type.Sub(e.Type) {
 			e.Type = types.Errorf("cannot use %s (type %v) as type %v", e.Left.identOr("value"), e.Left.Type, e.Type)
 		}
-		e.Type = e.Type.Derive(e.Left.Type)
+		e.Type = types.Swizzle(e.Type, types.Const, e.Left.Type)
 	case ExprBlock:
 		e.Type = e.Left.Type
 	case ExprFunc:
 		if len(e.Args) > 128 {
 			e.Type = types.Errorf("functions can have at most 128 arguments")
 		} else {
-			e.Type = types.Func(e.Left.Type, e.Args...)
+			e.Type = types.Func(e.Left.Type, e.Args...).Const()
 		}
 	case ExprTuple:
 		fields := make([]*types.Field, len(e.Fields))
 		for i := range e.Fields {
 			fields[i] = &types.Field{T: e.Fields[i].Type}
 		}
-		e.Type = types.Tuple(fields...)
+		e.Type = types.Tuple(fields...).Const()
 	case ExprStruct:
 		fields := make([]*types.Field, len(e.Fields))
 		for i, f := range e.Fields {
 			fields[i] = &types.Field{Name: f.Name, T: f.Expr.Type}
 		}
-		e.Type = types.Struct(fields...)
+		e.Type = types.Struct(fields...).Const()
 	case ExprList:
 		ts := make([]*types.T, len(e.List))
 		for i, ee := range e.List {
 			ts[i] = ee.Type
 		}
-		e.Type = types.List(unify(ts...))
+		e.Type = types.List(types.Unify(types.CanConst, ts...)).Const()
 	case ExprMap:
 		var kts, vts []*types.T
 		for k, v := range e.Map {
@@ -491,9 +562,16 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 		if len(kts) == 0 {
 			kt = types.Top
 		} else {
-			kt = unify(kts...)
+			kt = types.Unify(types.Const, kts...)
 		}
-		e.Type = types.Map(kt, unify(vts...))
+		e.Type = types.Map(kt, types.Unify(types.Const, vts...)).Const()
+	case ExprVariant:
+		if e.Left == nil {
+			// This is a variant with no element.
+			e.Type = types.Sum(&types.Variant{Tag: e.Ident})
+			return
+		}
+		e.Type = types.Sum(&types.Variant{Tag: e.Ident, Elem: e.Left.Type})
 	case ExprExec:
 		params := map[string]bool{}
 		for _, d := range e.Decls {
@@ -505,7 +583,7 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 				e.Type = types.Errorf("type error in parameter: %s", err)
 				return
 			}
-			if d.Expr.Type.Flow {
+			if d.Pat.Ident == "image" && d.Expr.Type.Flow {
 				e.Type = types.Errorf("exec parameter %s is not immediate", d.Pat.Ident)
 				return
 			}
@@ -513,6 +591,10 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 			params[ident] = true
 			switch ident {
 			case "image":
+				// Check is disabled temporarily until it is more useful.
+				if false && !d.Type.IsConst(nil) {
+					sess.Warn(e.Position, "image is not a const value")
+				}
 				if d.Type.Kind != types.StringKind {
 					e.Type = types.Errorf("image must be a string")
 					return
@@ -532,6 +614,11 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 			case "cpufeatures":
 				if d.Type.Kind != types.ListKind || d.Type.Elem.Kind != types.StringKind {
 					e.Type = types.Errorf("%s must be a list of strings", ident)
+					return
+				}
+			case "nondeterministic":
+				if d.Type.Kind != types.BoolKind {
+					e.Type = types.Errorf("%s must be a bool", ident)
 					return
 				}
 			default:
@@ -585,18 +672,45 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 		}
 		e.Type = e.Type.Copy()
 		e.Type.Flow = true
+		// TODO(marius): technically we can compute the flow as a const
+		// but that's not necessarily a useful definition.
+		e.Type.Level = types.NotConst
+		e.Type.Predicates.Clear()
 	case ExprCond:
 		if e.Cond.Type.Kind != types.BoolKind {
 			e.Type = types.Errorf("expected boolean expression, got %v", e.Cond.Type)
 			return
 		}
-		e.Type = unify(e.Left.Type, e.Right.Type)
+		e.Type = types.Unify(types.CanConst, e.Left.Type, e.Right.Type)
+		// Don't allow conditional constant evaluation (yet).
+		e.Type = types.Swizzle(e.Type, types.NotConst, e.Cond.Type)
+	case ExprSwitch:
+		caseTypes := make([]*types.T, len(e.CaseClauses))
+		for i, c := range e.CaseClauses {
+			env2 := env.Push()
+			defer reportUnused(sess, env2)
+			err := c.Pat.BindTypes(env2, e.Left.Type, types.Always)
+			if err != nil {
+				e.Type = types.Errorf("pattern %v is incompatible with type %v", c.Pat, e.Left.Type)
+				return
+			}
+			c.Expr.init(sess, env2)
+			caseTypes[i] = c.Expr.Type
+		}
+		if err := checkCases(e.Left.Type, e.Position, e.CaseClauses); err != nil {
+			e.Type = types.Error(err)
+			return
+		}
+		e.Type = types.Unify(types.CanConst, caseTypes...)
+		// Don't allow conditional constant evaluation (yet).
+		e.Type = types.Swizzle(e.Type, types.NotConst, e.Left.Type)
+		// TODO: Error on unreachable cases (i.e. shadowed patterns).
 	case ExprDeref:
 		if e.Left.Type.Kind != types.StructKind && e.Left.Type.Kind != types.ModuleKind {
 			e.Type = types.Errorf("expected struct or module, got %v", e.Left.Type)
 			return
 		}
-		e.Type = e.Left.Type.Field(e.Ident)
+		e.Type = types.Swizzle(e.Left.Type.Field(e.Ident), types.Const, e.Left.Type)
 	case ExprIndex:
 		switch e.Left.Type.Kind {
 		case types.ListKind:
@@ -604,35 +718,38 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 				e.Type = types.Errorf("expected %v, got %v", types.Int, e.Right.Type)
 				return
 			}
-			e.Type = e.Left.Type.Elem.Derive(e.Right.Type)
+			e.Type = types.Swizzle(e.Left.Type.Elem, types.Const, e.Right.Type)
 		case types.MapKind:
 			if !e.Left.Type.Index.Equal(e.Right.Type) {
 				e.Type = types.Errorf("expected %v, got %v", e.Right.Type, e.Left.Type)
 				return
 			}
-			e.Type = e.Left.Type.Elem.Derive(e.Right.Type)
+			e.Type = types.Swizzle(e.Left.Type.Elem, types.Const, e.Right.Type)
 		default:
 			e.Type = types.Errorf("expected a map or list, got %v", e.Left.Type)
 			return
 		}
 	case ExprCompr:
 		env = env.Push()
+		defer reportUnused(sess, env)
+		clauseTypes := make([]*types.T, len(e.ComprClauses))
 		for i, clause := range e.ComprClauses {
 			clause.Expr.init(sess, env)
 			if clause.Expr.Type.Kind == types.ErrorKind {
 				e.Type = clause.Expr.Type
 				return
 			}
+			clauseTypes[i] = clause.Expr.Type
 			switch clause.Kind {
 			case ComprEnum:
 				switch clause.Expr.Type.Kind {
 				case types.ListKind:
-					if err := clause.Pat.BindTypes(env, clause.Expr.Type.Elem); err != nil {
+					if err := clause.Pat.BindTypes(env, clause.Expr.Type.Elem, types.Always); err != nil {
 						e.Type = types.Error(err)
 						return
 					}
 				case types.MapKind:
-					if err := clause.Pat.BindTypes(env, types.Tuple(&types.Field{T: clause.Expr.Type.Index}, &types.Field{T: clause.Expr.Type.Elem})); err != nil {
+					if err := clause.Pat.BindTypes(env, types.Tuple(&types.Field{T: clause.Expr.Type.Index}, &types.Field{T: clause.Expr.Type.Elem}), types.Always); err != nil {
 						e.Type = types.Error(err)
 						return
 					}
@@ -653,13 +770,15 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 		}
 		e.ComprExpr.init(sess, env)
 		e.Type = types.List(e.ComprExpr.Type)
+		// Don't (yet) allow constant comptuation of comprehensions.
+		e.Type = types.Swizzle(e.Type, types.NotConst, clauseTypes...)
 	case ExprThunk:
 		// ExprThunks are synthetic expressions and are always typed.
 		if e.Type == nil {
 			panic("untyped thunk")
 		}
 	case ExprMake:
-		if e.Left.Kind != ExprConst {
+		if e.Left.Kind != ExprLit {
 			panic("invalid make expression")
 		}
 		if e.Left.Type.Kind != types.StringKind {
@@ -677,9 +796,9 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 		for _, d := range e.Decls {
 			d.Init(sess, env)
 			if d.Type.Kind == types.ErrorKind {
-				e.Type = typeError
+				e.Type = types.Errorf("type error")
 				return
-			} else if err := d.Pat.BindTypes(penv, d.Type); err != nil {
+			} else if err := d.Pat.BindTypes(penv, d.Type, types.Never); err != nil {
 				e.Type = types.Error(err)
 				return
 			}
@@ -690,111 +809,188 @@ func (e *Expr) init(sess *Session, env *types.Env) {
 		}
 		// Modules are never flow values because their evaluation never depends
 		// on parameters fully evaluating.
-		e.Type = e.Module.Type()
+		e.Type = e.Module.Type(penv)
 	case ExprBuiltin:
 		switch e.Op {
 		default:
 			panic("invalid builtin " + e.Op)
 		case "len":
-			switch e.Left.Type.Kind {
+			arg0 := e.Fields[0].Expr
+			switch arg0.Type.Kind {
 			case types.FileKind, types.DirKind, types.ListKind, types.MapKind:
-				e.Type = types.Int.Derive(e.Left.Type)
+				e.Type = types.Swizzle(types.Int, types.Const, arg0.Type)
 			default:
-				e.Type = types.Errorf("cannot apply len operator to value of type %s", e.Left.Type)
+				e.Type = types.Errorf("cannot apply len operator to value of type %s", arg0.Type)
 			}
 		case "int":
-			switch e.Left.Type.Kind {
+			arg0 := e.Fields[0].Expr
+			switch arg0.Type.Kind {
 			case types.FloatKind:
-				e.Type = types.Int.Derive(e.Left.Type)
+				e.Type = types.Swizzle(types.Int, types.Const, arg0.Type)
 			default:
-				e.Type = types.Errorf("cannot convert type %s to int", e.Left.Type)
+				e.Type = types.Errorf("cannot convert type %s to int", arg0.Type)
 			}
 
 		case "float":
-			switch e.Left.Type.Kind {
+			arg0 := e.Fields[0].Expr
+			switch arg0.Type.Kind {
 			case types.IntKind:
-				e.Type = types.Float.Derive(e.Left.Type)
+				e.Type = types.Swizzle(types.Float, types.Const, arg0.Type)
 			default:
-				e.Type = types.Errorf("cannot convert type %s to float", e.Left.Type)
+				e.Type = types.Errorf("cannot convert type %s to float", arg0.Type)
 			}
 		case "zip":
-			if e.Left.Type.Kind != types.ListKind {
-				e.Type = types.Errorf("zip expects a list, not %s", e.Left.Type)
-			} else if e.Right.Type.Kind != types.ListKind {
-				e.Type = types.Errorf("zip expects a list, not %s", e.Right.Type)
+			arg0, arg1 := e.Fields[0].Expr, e.Fields[1].Expr
+			if arg0.Type.Kind != types.ListKind {
+				e.Type = types.Errorf("zip expects a list, not %s", arg0.Type)
+			} else if arg1.Type.Kind != types.ListKind {
+				e.Type = types.Errorf("zip expects a list, not %s", arg1.Type)
 			} else {
 				e.Type = types.List(types.Tuple(
-					&types.Field{T: e.Left.Type.Elem},
-					&types.Field{T: e.Right.Type.Elem}))
+					&types.Field{T: arg0.Type.Elem},
+					&types.Field{T: arg1.Type.Elem}))
 			}
 		case "unzip":
-			if e.Left.Type.Kind != types.ListKind {
-				e.Type = types.Errorf("unzip expects a list, not %s", e.Left.Type)
-			} else if e.Left.Type.Elem.Kind != types.TupleKind {
-				e.Type = types.Errorf("unzip expects a list of tuples, not %s", e.Left.Type.Elem)
-			} else if len(e.Left.Type.Elem.Fields) != 2 {
-				e.Type = types.Errorf("unzip expects a list of 2-tuples, not %s", e.Left.Type.Elem)
+			arg0 := e.Fields[0].Expr
+			if arg0.Type.Kind != types.ListKind {
+				e.Type = types.Errorf("unzip expects a list, not %s", arg0.Type)
+			} else if arg0.Type.Elem.Kind != types.TupleKind {
+				e.Type = types.Errorf("unzip expects a list of tuple elements, not a list of %s elements", arg0.Type.Elem)
+			} else if len(arg0.Type.Elem.Fields) != 2 {
+				e.Type = types.Errorf("unzip expects a list of 2-tuple elements, not a list of %s elements", arg0.Type.Elem)
 			} else {
 				e.Type = types.Tuple(
-					&types.Field{T: types.List(e.Left.Type.Elem.Fields[0].T)},
-					&types.Field{T: types.List(e.Left.Type.Elem.Fields[1].T)})
+					&types.Field{T: types.List(arg0.Type.Elem.Fields[0].T)},
+					&types.Field{T: types.List(arg0.Type.Elem.Fields[1].T)})
 			}
 		case "flatten":
-			if e.Left.Type.Kind != types.ListKind || e.Left.Type.Elem.Kind != types.ListKind {
-				e.Type = types.Errorf("flatten expects a list of lists, got %s", e.Left.Type)
+			arg0 := e.Fields[0].Expr
+			if arg0.Type.Kind != types.ListKind || arg0.Type.Elem.Kind != types.ListKind {
+				e.Type = types.Errorf("flatten expects a list of lists, got %s", arg0.Type)
 			} else {
-				e.Type = e.Left.Type.Elem
+				e.Type = types.Swizzle(arg0.Type.Elem, types.Const, arg0.Type)
 			}
 		case "map":
-			switch e.Left.Type.Kind {
+			arg0 := e.Fields[0].Expr
+			switch arg0.Type.Kind {
 			default:
-				e.Type = types.Errorf("cannot convert type %s to map", e.Left.Type)
+				e.Type = types.Errorf("cannot convert type %s to map", arg0.Type)
 			case types.ListKind:
-				if e.Left.Type.Elem.Kind != types.TupleKind {
-					e.Type = types.Errorf("map expects a list of tuples, not %s", e.Left.Type.Elem)
-				} else if len(e.Left.Type.Elem.Fields) != 2 {
-					e.Type = types.Errorf("map expects a list of 2-tuples, not %s", e.Left.Type.Elem)
-				} else if e.Left.Type.Elem.Fields[0].Kind != types.StringKind && e.Left.Type.Elem.Fields[0].Kind != types.IntKind {
-					e.Type = types.Errorf("type %s is not a valid map index", e.Left.Type.Elem.Fields[0].T)
+				if arg0.Type.Elem.Kind != types.TupleKind {
+					e.Type = types.Errorf("map expects a list of tuples, not %s", arg0.Type.Elem)
+				} else if len(arg0.Type.Elem.Fields) != 2 {
+					e.Type = types.Errorf("map expects a list of 2-tuples, not %s", arg0.Type.Elem)
+				} else if arg0.Type.Elem.Fields[0].Kind != types.StringKind && arg0.Type.Elem.Fields[0].Kind != types.IntKind {
+					e.Type = types.Errorf("type %s is not a valid map index", arg0.Type.Elem.Fields[0].T)
 				} else {
-					e.Type = types.Map(e.Left.Type.Elem.Fields[0].T, e.Left.Type.Elem.Fields[1].T)
+					e.Type = types.Map(arg0.Type.Elem.Fields[0].T, arg0.Type.Elem.Fields[1].T)
 				}
 			case types.DirKind:
 				e.Type = types.Map(types.String, types.File)
 			}
+			e.Type = types.Swizzle(e.Type, types.Const, arg0.Type)
 		case "list":
-			switch e.Left.Type.Kind {
+			arg0 := e.Fields[0].Expr
+			switch arg0.Type.Kind {
 			default:
-				e.Type = types.Errorf("cannot convert type %s to list", e.Left.Type)
+				e.Type = types.Errorf("cannot convert type %s to list", arg0.Type)
 			case types.MapKind:
 				e.Type = types.List(types.Tuple(
-					&types.Field{T: e.Left.Type.Index},
-					&types.Field{T: e.Left.Type.Elem}))
+					&types.Field{T: arg0.Type.Index},
+					&types.Field{T: arg0.Type.Elem})).Const()
 			case types.DirKind:
 				e.Type = types.List(types.Tuple(
 					&types.Field{T: types.String},
-					&types.Field{T: types.File}))
+					&types.Field{T: types.File})).Const()
 			}
+			e.Type = types.Swizzle(e.Type, types.Const, arg0.Type)
 		case "panic":
-			if e.Left.Type.Kind != types.StringKind {
-				e.Type = types.Errorf("panic expects a string, not %s", e.Left.Type)
+			arg0 := e.Fields[0].Expr
+			if arg0.Type.Kind != types.StringKind {
+				e.Type = types.Errorf("panic expects a string, not %s", arg0.Type)
 			} else {
 				e.Type = types.Bottom
 			}
 		case "delay":
-			e.Type = types.Flow(e.Left.Type)
+			arg := e.Fields[0].Expr
+			e.Type = arg.Type.Copy()
+			e.Type.Level = types.NotConst
+			e.Type.Flow = true
 		case "trace":
-			e.Type = e.Left.Type
+			e.Type = e.Fields[0].Expr.Type
 		case "range":
-			if e.Left.Type.Kind != types.IntKind {
-				e.Type = types.Errorf("range expects an integer, not %s", e.Left.Type)
-			} else if e.Right.Type.Kind != types.IntKind {
-				e.Type = types.Errorf("range expects an integer, not %s", e.Right.Type)
+			arg0, arg1 := e.Fields[0].Expr, e.Fields[1].Expr
+			if arg0.Type.Kind != types.IntKind {
+				e.Type = types.Errorf("range expects an integer, not %s", arg0.Type)
+			} else if arg1.Type.Kind != types.IntKind {
+				e.Type = types.Errorf("range expects an integer, not %s", arg1.Type)
 			} else {
 				e.Type = types.List(types.Int)
-				e.Type = e.Type.Derive(e.Left.Type)
-				e.Type = e.Type.Derive(e.Right.Type)
+				e.Type.Level = types.CanConst
+				e.Type = types.Swizzle(e.Type, types.Const, arg0.Type, arg1.Type)
 			}
+		case "reduce":
+			if len(e.Fields) != 2 {
+				e.Type = types.Errorf("reduce expects two arguments, got %v", len(e.Fields))
+				return
+			}
+			if e.Fields[0].Expr.Type.Kind != types.FuncKind {
+				e.Type = types.Errorf("reduce expects a function as its first argument, got %v", e.Fields[0].Expr.Type)
+				return
+			}
+			if e.Fields[1].Expr.Type.Kind != types.ListKind {
+				e.Type = types.Errorf("reduce expects a list as its second argument, got %v", e.Fields[1].Expr.Type)
+				return
+			}
+			elemType := e.Fields[1].Expr.Type.Elem
+			reduceType := e.Fields[0].Expr.Type.Elem
+			if !elemType.Sub(reduceType) {
+				fType := types.Func(elemType, &types.Field{T: elemType}, &types.Field{T: elemType})
+				e.Type = types.Errorf("reduce expects first argument of type %v, got %v", fType, e.Fields[0].Expr.Type)
+				return
+			}
+			// Allow function subtyping.
+			fType := types.Func(reduceType, &types.Field{T: reduceType}, &types.Field{T: reduceType})
+			if !e.Fields[0].Expr.Type.Sub(fType) {
+				e.Type = types.Errorf("reduce expects first argument of type %v, got %v", fType, e.Fields[0].Expr.Type)
+				return
+			}
+			e.Type = reduceType
+			e.Type = types.Swizzle(e.Type, types.Const, e.Fields[0].Expr.Type, e.Fields[1].Expr.Type)
+		case "fold":
+			if len(e.Fields) != 3 {
+				e.Type = types.Errorf("fold expects three arguments, got %v", len(e.Fields))
+				return
+			}
+			if e.Fields[0].Expr.Type.Kind != types.FuncKind || len(e.Fields[0].Expr.Type.Fields) != 2 {
+				e.Type = types.Errorf("fold expects a function with two arguments as its first argument, got %v", e.Fields[0].Expr.Type)
+				return
+			}
+			if e.Fields[1].Expr.Type.Kind != types.ListKind {
+				e.Type = types.Errorf("fold expects a list as its second argument, got %v", e.Fields[1].Expr.Type)
+				return
+			}
+			foldType := e.Fields[0].Expr.Type.Elem
+			foldAccArgType := e.Fields[0].Expr.Type.Fields[0].T
+			elemType := e.Fields[1].Expr.Type.Elem
+			accType := e.Fields[2].Expr.Type
+			// Express type bounds.
+			if !accType.Sub(foldAccArgType) {
+				fType := types.Func(accType, &types.Field{T: accType}, &types.Field{T: elemType})
+				e.Type = types.Errorf("fold expects first argument of type %v, got %v", fType, e.Fields[0].Expr.Type)
+				return
+			}
+			// Fix element type, and synthesize expected function type.
+			// Note: We allow the accumulator function to return a subtype of the accumulator function parameter.
+			// This is so that the accumulate function is compliant with reflow's function type even though it
+			// seems incorrect to let the return type be a subtype.
+			fType := types.Func(foldAccArgType, &types.Field{T: foldAccArgType}, &types.Field{T: elemType})
+			if !e.Fields[0].Expr.Type.Sub(fType) {
+				e.Type = types.Errorf("fold expects first argument of type %v, got %v", fType, e.Fields[0].Expr.Type)
+				return
+			}
+			e.Type = foldType
+			e.Type = types.Swizzle(e.Type, types.Const, e.Fields[0].Expr.Type, e.Fields[1].Expr.Type, e.Fields[2].Expr.Type)
 		}
 	case ExprRequires:
 		if err := e.initResources(sess, env); err != nil {
@@ -884,7 +1080,7 @@ func (e *Expr) Equal(f *Expr) bool {
 		return e.Left.Equal(f.Left) && e.Right.Equal(f.Right)
 	case ExprUnop:
 		return e.Left.Equal(f.Left)
-	case ExprConst:
+	case ExprLit:
 		return e.Type.Equal(f.Type) && values.Equal(e.Val, f.Val)
 	case ExprAscribe:
 		return e.Left.Equal(f.Left) && e.Type.Equal(f.Type)
@@ -960,6 +1156,18 @@ func (e *Expr) Equal(f *Expr) bool {
 			}
 		}
 		return true
+	case ExprVariant:
+		switch {
+		case e.Ident != f.Ident:
+			return false
+		case e.Left == nil && f.Left == nil:
+			return true
+		case e.Left == nil || f.Left == nil:
+			// One is nil, but the other is not, so they're not equal.
+			return false
+		default:
+			return e.Left.Equal(f.Left)
+		}
 	case ExprExec:
 		if len(e.Decls) != len(f.Decls) {
 			return false
@@ -975,6 +1183,19 @@ func (e *Expr) Equal(f *Expr) bool {
 		return e.Template == f.Template
 	case ExprCond:
 		return e.Cond.Equal(f.Cond) && e.Left.Equal(f.Left) && e.Right.Equal(f.Right)
+	case ExprSwitch:
+		if !e.Left.Equal(f.Left) {
+			return false
+		}
+		if len(e.CaseClauses) != len(f.CaseClauses) {
+			return false
+		}
+		for i := range e.CaseClauses {
+			if !e.CaseClauses[i].Equal(f.CaseClauses[i]) {
+				return false
+			}
+		}
+		return true
 	}
 }
 
@@ -1004,7 +1225,7 @@ func (e *Expr) String() string {
 			fields[i] = f.Expr.String()
 		}
 		fmt.Fprintf(b, "apply(%v(%v))", e.Left, strings.Join(fields, ", "))
-	case ExprConst:
+	case ExprLit:
 		fmt.Fprintf(b, "const(%v)", values.Sprint(e.Val, e.Type))
 	case ExprAscribe:
 		fmt.Fprintf(b, "ascribe(%v)", e.Left)
@@ -1050,6 +1271,12 @@ func (e *Expr) String() string {
 			list[i] = key + ":" + m[key]
 		}
 		fmt.Fprintf(b, "map(%v)", strings.Join(list, ", "))
+	case ExprVariant:
+		if e.Left == nil {
+			fmt.Fprintf(b, "variant(#%s)", e.Ident)
+			break
+		}
+		fmt.Fprintf(b, "variant(#%s, %v)", e.Ident, e.Left)
 	case ExprExec:
 		decls := make([]string, len(e.Decls))
 		for i := range e.Decls {
@@ -1059,6 +1286,13 @@ func (e *Expr) String() string {
 			strings.Join(decls, ", "), e.Type, e.Template)
 	case ExprCond:
 		fmt.Fprintf(b, "cond(%v, %v, %v)", e.Cond, e.Left, e.Right)
+	case ExprSwitch:
+		clauses := make([]string, len(e.CaseClauses))
+		for i := range e.CaseClauses {
+			clauses[i] = e.CaseClauses[i].String()
+		}
+		fmt.Fprintf(b, "switch(%v, cases(%v))", e.Left,
+			strings.Join(clauses, ", "))
 	case ExprDeref:
 		fmt.Fprintf(b, "deref(%v, %v)", e.Left, e.Ident)
 	case ExprCompr:
@@ -1075,7 +1309,12 @@ func (e *Expr) String() string {
 	case ExprThunk:
 		fmt.Fprintf(b, "thunk(%v, %v)", e.Left, e.Env)
 	case ExprBuiltin:
-		fmt.Fprintf(b, "builtin(%v, %v)", e.Op, e.Left)
+		var args string
+		for _, field := range e.Fields {
+			args += fmt.Sprintf("%v, ", field.Expr)
+		}
+		args = strings.TrimRight(args, " ,")
+		fmt.Fprintf(b, "builtin(%v, %v)", e.Op, args)
 	case ExprRequires:
 		decls := make([]string, len(e.Decls))
 		for i := range e.Decls {
@@ -1089,6 +1328,8 @@ func (e *Expr) String() string {
 			decls[i] = e.Decls[i].String()
 		}
 		fmt.Fprintf(b, "make(%s, %v)", e.Left, strings.Join(decls, ", "))
+	case ExprIndex:
+		fmt.Fprintf(b, "index(%s, %s)", e.Left, e.Right)
 	}
 	return b.String()
 }
@@ -1141,7 +1382,7 @@ func (e *Expr) Abbrev() string {
 			fields[i] = e.Fields[i].Abbrev()
 		}
 		return fmt.Sprintf("%s(%s)", e.Left.Abbrev(), strings.Join(fields, ", "))
-	case ExprConst:
+	case ExprLit:
 		// Constant expressions are always constructed with a type.
 		return values.Sprint(e.Val, e.Type)
 	case ExprAscribe:
@@ -1176,10 +1417,23 @@ func (e *Expr) Abbrev() string {
 			elems = append(elems, fmt.Sprintf("%s: %s", ke.Abbrev(), ve.Abbrev()))
 		}
 		return "[" + strings.Join(elems, ", ") + "]"
+	case ExprVariant:
+		if e.Left == nil {
+			return fmt.Sprintf("#%s", e.Ident)
+		}
+		return fmt.Sprintf("#%s(%v)", e.Ident, e.Left)
 	case ExprExec:
 		return "<exec>"
 	case ExprCond:
 		return fmt.Sprintf("if %s { %s } else { %s }", e.Cond.Abbrev(), e.Left.Abbrev(), e.Right.Abbrev())
+	case ExprSwitch:
+		cases := make([]string, len(e.CaseClauses))
+		for i, c := range e.CaseClauses {
+			cases[i] = fmt.Sprintf("case %s: %s", c.Pat.String(),
+				c.Expr.Abbrev())
+		}
+		return fmt.Sprintf("switch %s { %s }", e.Left.Abbrev(),
+			strings.Join(cases, " "))
 	case ExprDeref:
 		return e.Left.Abbrev() + "." + e.Ident
 	case ExprIndex:
@@ -1192,12 +1446,11 @@ func (e *Expr) Abbrev() string {
 		var b bytes.Buffer
 		b.WriteString(e.Op)
 		b.WriteString("(")
-		if e.Left != nil {
-			b.WriteString(e.Left.Abbrev())
-		}
-		if e.Right != nil {
-			b.WriteString(", ")
-			b.WriteString(e.Right.Abbrev())
+		for i := range e.Fields {
+			b.WriteString(e.Fields[i].Expr.Abbrev())
+			if i < len(e.Fields)-1 {
+				b.WriteString(", ")
+			}
 		}
 		b.WriteString(")")
 		return b.String()
@@ -1246,4 +1499,25 @@ func (s sortedExpr) Less(i, j int) bool {
 }
 func (s sortedExpr) Swap(i, j int) {
 	s.exprs[i], s.exprs[j] = s.exprs[j], s.exprs[i]
+}
+
+func reportUnused(sess *Session, env *types.Env) {
+	syms := env.Unused()
+	// Sort them so that we get consistent (testable) warning ordering.
+	sort.Slice(syms, func(i, j int) bool {
+		x, y := syms[i], syms[j]
+		if x.Filename != y.Filename {
+			return x.Filename < y.Filename
+		}
+		if x.Offset != y.Offset {
+			return x.Offset < y.Offset
+		}
+		if x.Line != y.Line {
+			return x.Line < y.Line
+		}
+		return x.Column < y.Column
+	})
+	for _, sym := range syms {
+		sess.Warnf(sym.Position, "%s declared and not used", sym.Name)
+	}
 }

@@ -12,9 +12,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	golog "log"
 	"math/rand"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +28,7 @@ import (
 	"github.com/grailbio/reflow/log"
 	"github.com/grailbio/reflow/pool"
 	"github.com/grailbio/reflow/sched"
+	"github.com/grailbio/reflow/taskdb"
 	"github.com/grailbio/reflow/test/testutil"
 )
 
@@ -43,17 +47,31 @@ func (c *counter) NextID() digest.Digest {
 	return reflow.Digester.New(b)
 }
 
-var ntask, nalloc counter
+var nalloc counter
 
-func newTask(cpu, mem float64) *sched.Task {
+func newTask(cpu, mem float64, priority int) *sched.Task {
 	task := sched.NewTask()
-	task.ID = ntask.NextID()
+	task.Priority = priority
 	task.Config.Resources = reflow.Resources{"cpu": cpu, "mem": mem}
+	task.ID = taskdb.NewTaskID()
 	if *logTasks {
-		out := golog.New(os.Stderr, fmt.Sprintf("task %s (%s): ", task.ID.Short(), task.Config.Resources), golog.LstdFlags)
+		out := golog.New(os.Stderr, fmt.Sprintf("task %s (%s): ", task.ID.IDShort(), task.Config.Resources), golog.LstdFlags)
 		task.Log = log.New(out, log.DebugLevel)
 	}
 	return task
+}
+
+func newTasks(numTasks int) []*sched.Task {
+	tasks := make([]*sched.Task, numTasks)
+	for i := 0; i < numTasks; i++ {
+		tasks[i] = &sched.Task{
+			ID: taskdb.NewTaskID(),
+			Config: reflow.ExecConfig{
+				Type: "exec",
+			},
+		}
+	}
+	return tasks
 }
 
 func newRequirements(cpu, mem float64, width int) reflow.Requirements {
@@ -64,6 +82,7 @@ func newRequirements(cpu, mem float64, width int) reflow.Requirements {
 }
 
 func randomFileset(repo reflow.Repository) reflow.Fileset {
+	fuzz := testutil.NewFuzz(nil)
 	n := rand.Intn(100) + 1
 	var fs reflow.Fileset
 	fs.Map = make(map[string]reflow.File, n)
@@ -77,7 +96,29 @@ func randomFileset(repo reflow.Repository) reflow.Fileset {
 			panic(err)
 		}
 		path := fmt.Sprintf("file%d", i)
-		fs.Map[path] = reflow.File{ID: d, Size: int64(len(p))}
+		f := fuzz.File(false, true)
+		f.ID = d
+		f.Size = int64(len(p))
+		fs.Map[path] = f
+	}
+	return fs
+}
+
+func randomRepoFileset(repo reflow.Repository) reflow.Fileset {
+	n := rand.Intn(100) + 1
+	var fs reflow.Fileset
+	fs.Map = make(map[string]reflow.File, n)
+	for i := 0; i < n; i++ {
+		p := make([]byte, rand.Intn(1024)+1)
+		if _, err := rand.Read(p); err != nil {
+			panic(err)
+		}
+		d, err := repo.Put(context.TODO(), bytes.NewReader(p))
+		if err != nil {
+			panic(err)
+		}
+		path := fmt.Sprintf("file%d", i)
+		fs.Map[path] = reflow.File{ID: d, Size: int64(len(p)), Source: repo.URL().String() + "/" + d.String()}
 	}
 	return fs
 }
@@ -107,10 +148,14 @@ func (c *testCluster) Req() <-chan testClusterAllocReq {
 
 func (c *testCluster) Allocate(ctx context.Context, req reflow.Requirements, labels pool.Labels) (pool.Alloc, error) {
 	replyc := make(chan testClusterAllocReply)
-	c.reqs <- testClusterAllocReq{
+	select {
+	case c.reqs <- testClusterAllocReq{
 		Requirements: req,
 		Labels:       labels,
 		Reply:        replyc,
+	}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 	select {
 	case reply := <-replyc:
@@ -119,8 +164,6 @@ func (c *testCluster) Allocate(ctx context.Context, req reflow.Requirements, lab
 		return nil, ctx.Err()
 	}
 }
-
-type testExecState int
 
 type testExec struct {
 	reflow.Exec
@@ -192,11 +235,13 @@ type testAlloc struct {
 	repository *testutil.InmemoryRepository
 	resources  reflow.Resources
 
-	mu    sync.Mutex
-	cond  *sync.Cond
-	execs map[digest.Digest]*testExec
-	err   error
-	hung  bool
+	mu         sync.Mutex
+	cond       *sync.Cond
+	execs      map[digest.Digest]*testExec
+	err        error
+	hung       bool
+	refCountMu sync.Mutex
+	refCount   map[digest.Digest]int64
 }
 
 func newTestAlloc(resources reflow.Resources) *testAlloc {
@@ -205,6 +250,7 @@ func newTestAlloc(resources reflow.Resources) *testAlloc {
 		execs:      make(map[digest.Digest]*testExec),
 		resources:  resources,
 		id:         nalloc.Next(),
+		refCount:   make(map[digest.Digest]int64),
 	}
 	alloc.cond = sync.NewCond(&alloc.mu)
 	return alloc
@@ -222,13 +268,108 @@ func (a *testAlloc) Repository() reflow.Repository {
 	return a.repository
 }
 
-func (a *testAlloc) Load(ctx context.Context, fs reflow.Fileset) (reflow.Fileset, error) {
+func (a *testAlloc) Load(ctx context.Context, url *url.URL, fs reflow.Fileset) (reflow.Fileset, error) {
+	a.refCountMu.Lock()
+	defer a.refCountMu.Unlock()
+	var (
+		resolved = make(map[digest.Digest]reflow.File)
+		id       digest.Digest
+		res      reflow.File
+	)
 	for _, file := range fs.Files() {
 		if file.IsRef() {
-			return reflow.Fileset{}, errors.New("unexpected file reference")
+			u, err := url.Parse(file.Source)
+			if err != nil {
+				return reflow.Fileset{}, err
+			}
+			repo := testutil.GetInMemoryRepository(u)
+			id, err = reflow.Digester.Parse(strings.Trim(u.Path, "/"))
+			if err != nil {
+				return reflow.Fileset{}, err
+			}
+			var rc io.ReadCloser
+			if rc, err = repo.Get(ctx, id); err != nil {
+				return reflow.Fileset{}, err
+			}
+			if _, err = a.repository.Put(ctx, rc); err != nil {
+				return reflow.Fileset{}, err
+			}
+			if err = rc.Close(); err != nil {
+				return reflow.Fileset{}, err
+			}
+			res, err = a.repository.Stat(ctx, id)
+			if err != nil {
+				return reflow.Fileset{}, err
+			}
+		} else {
+			id = file.ID
+			repo := testutil.GetInMemoryRepository(url)
+			r, err := repo.Get(ctx, file.ID)
+			if err != nil {
+				return reflow.Fileset{}, err
+			}
+			id, err = a.repository.Put(ctx, r)
+			if err != nil {
+				return reflow.Fileset{}, err
+			}
+			res, err = a.repository.Stat(ctx, id)
+			if err != nil {
+				return reflow.Fileset{}, err
+			}
+		}
+		a.refCount[res.ID]++
+		resolved[file.Digest()] = res
+	}
+	out, ok := fs.Subst(resolved)
+	if !ok {
+		return reflow.Fileset{}, errors.New("unresolved files")
+	}
+	return out, nil
+}
+
+// VerifyIntegrity verifies the integrity of the given set of files
+func (a *testAlloc) VerifyIntegrity(ctx context.Context, fs reflow.Fileset) error {
+	a.refCountMu.Lock()
+	defer a.refCountMu.Unlock()
+	for _, file := range fs.Files() {
+		if file.IsRef() {
+			return errors.New("unexpected file reference")
+		}
+		rc, err := a.repository.Get(ctx, file.ID)
+		if err != nil {
+			return err
+		}
+		w := reflow.Digester.NewWriter()
+		if _, err = io.Copy(w, rc); err == nil {
+			d := w.Digest()
+			if file.ID != d {
+				err = fmt.Errorf("digest %s mismatches ID %s", d.Short(), file.ID.Short())
+			}
+		}
+		_ = rc.Close()
+		if err != nil {
+			return err
 		}
 	}
-	return fs, nil
+	return nil
+}
+
+func (a *testAlloc) Unload(ctx context.Context, fs reflow.Fileset) error {
+	a.refCountMu.Lock()
+	defer a.refCountMu.Unlock()
+	for _, file := range fs.Files() {
+		if file.IsRef() {
+			return errors.New("unexpected file reference")
+		}
+		a.refCount[file.ID]--
+		if a.refCount[file.ID] == 0 {
+			a.repository.Delete(ctx, file.ID)
+		}
+		if a.refCount[file.ID] < 0 {
+			golog.Panicf("unload: %v has negative ref count", file.ID)
+		}
+	}
+	return nil
 }
 
 func (a *testAlloc) Put(ctx context.Context, id digest.Digest, config reflow.ExecConfig) (reflow.Exec, error) {

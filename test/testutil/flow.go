@@ -27,11 +27,8 @@ func File(contents string) reflow.File {
 	}
 }
 
-// Files returns a value comprising the given files with contents derived from
-// their names.
-func Files(files ...string) reflow.Fileset {
-	var v reflow.Fileset
-	v.Map = map[string]reflow.File{}
+func fileContents(files ...string) map[string]string {
+	fc := make(map[string]string, len(files))
 	for _, file := range files {
 		var path, contents string
 		parts := strings.SplitN(file, ":", 2)
@@ -43,6 +40,17 @@ func Files(files ...string) reflow.Fileset {
 			path = parts[0]
 			contents = parts[1]
 		}
+		fc[path] = contents
+	}
+	return fc
+}
+
+// Files returns a value comprising the given files with contents derived from
+// their names.
+func Files(files ...string) reflow.Fileset {
+	var v reflow.Fileset
+	v.Map = map[string]reflow.File{}
+	for path, contents := range fileContents(files...) {
 		v.Map[path] = File(contents)
 	}
 	return v
@@ -51,8 +59,8 @@ func Files(files ...string) reflow.Fileset {
 // WriteFiles writes the provided files into the repository r and
 // returns a Fileset as in Files.
 func WriteFiles(r reflow.Repository, files ...string) reflow.Fileset {
-	for _, file := range files {
-		_, err := r.Put(context.Background(), bytes.NewReader([]byte(file)))
+	for _, contents := range fileContents(files...) {
+		_, err := r.Put(context.Background(), bytes.NewReader([]byte(contents)))
 		if err != nil {
 			panic(fmt.Sprintf("unexpected error writing to repository: %v", err))
 		}
@@ -73,7 +81,12 @@ func WriteFile(r reflow.Repository, content string) reflow.File {
 // WriteCache writes the provided files into the eval's repository and registers
 // a Fileset cache assoc.
 func WriteCache(e *flow.Eval, key digest.Digest, files ...string) {
-	fs := WriteFiles(e.Repository, files...)
+	WriteCacheFileset(e, key, WriteFiles(e.Repository, files...))
+}
+
+// WriteCacheFileset writes the provided fileset into the eval's repository and registers
+// a Fileset cache assoc.
+func WriteCacheFileset(e *flow.Eval, key digest.Digest, fs reflow.Fileset) {
 	fsid, err := repository.Marshal(context.Background(), e.Repository, fs)
 	if err != nil {
 		unexpected(err)

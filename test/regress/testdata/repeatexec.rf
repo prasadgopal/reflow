@@ -1,0 +1,23 @@
+// This tests test.ExecRepeatAndCheck functionality.
+
+val gen = make("./generate.rf")
+val test = make("$/test")
+
+func CatCopy(in file, random bool) =
+	if random {
+		exec(image := "ubuntu", mem := 10*MiB) (out file) {"
+		echo $RANDOM > {{out}}
+			cat {{in}} >> {{out}}
+		"}
+	} else {
+		exec(image := "ubuntu", mem := 10*MiB) (out file) {"
+		cat {{in}} > {{out}}
+		"}
+	}
+
+@requires(cpu := 1)
+val Main = gen.GenerateFixed("localfile://inputdata") ~> test.Assert([
+	test.ExecRepeatAndCheck(CatCopy(file("localfile://inputdata"), false), 1),
+	test.ExecRepeatAndCheck(CatCopy(file("localfile://inputdata"), false), 3),
+	false == test.ExecRepeatAndCheck(CatCopy(file("localfile://inputdata"), true), 3),
+])

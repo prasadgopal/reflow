@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -22,17 +24,26 @@ import (
 
 	"github.com/grailbio/base/data"
 	"github.com/grailbio/base/digest"
+	"github.com/grailbio/base/limiter"
 	"github.com/grailbio/base/status"
+	"github.com/grailbio/base/sync/once"
+	"github.com/grailbio/base/traverse"
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/assoc"
 	"github.com/grailbio/reflow/errors"
+	infra2 "github.com/grailbio/reflow/infra"
 	"github.com/grailbio/reflow/liveset/bloomlive"
 	"github.com/grailbio/reflow/log"
+	"github.com/grailbio/reflow/pool"
+	"github.com/grailbio/reflow/predictor"
 	"github.com/grailbio/reflow/sched"
+	"github.com/grailbio/reflow/taskdb"
 	"github.com/grailbio/reflow/trace"
 	"github.com/grailbio/reflow/values"
 	"github.com/willf/bloom"
 	"golang.org/x/sync/errgroup"
+	"gonum.org/v1/gonum/graph/encoding/dot"
+	"gonum.org/v1/gonum/graph/simple"
 )
 
 const (
@@ -45,43 +56,27 @@ const (
 
 	// printAllTasks can be set to aid testing and debugging.
 	printAllTasks = false
+
+	// maxOOMRetries is the maximum number of times a task can be retried due to an OOM.
+	maxOOMRetries = 3
+
+	// memMultiplier is the increase in memory that will be allocated to a task which OOMs.
+	memMultiplier = 1.5
+
+	// memSuggestThreshold is the minimum fraction of allocated memory an exec can use before a suggestion is
+	// displayed to use less memory.
+	memSuggestThreshold = 0.6
 )
 
-const defaultCacheLookupTimeout = time.Minute
+const defaultCacheLookupTimeout = 20 * time.Minute
 
 // stateStatusOrder defines the order in which differenet flow
 // statuses are rendered.
 var stateStatusOrder = []State{
-	Running, Transfer, Ready, Done,
+	Execing, Running, Transfer, Ready, Done,
 
 	// DEBUG:
 	NeedLookup, Lookup, NeedTransfer, TODO,
-}
-
-// CacheMode is a bitmask that tells how caching is to be used
-// in the evaluator.
-type CacheMode int
-
-const (
-	// CacheOff is CacheMode's default value and indicates
-	// no caching (read or write) is to be performed.
-	CacheOff CacheMode = 0
-	// CacheRead indicates that cache lookups should be performed
-	// during evaluation.
-	CacheRead CacheMode = 1 << iota
-	// CacheWrite indicates that the evaluator should write evaluation
-	// results to the cache.
-	CacheWrite
-)
-
-// Reading returns whether the cache mode contains CacheRead.
-func (m CacheMode) Reading() bool {
-	return m&CacheRead == CacheRead
-}
-
-// Writing returns whether the cache mode contains CacheWrite.
-func (m CacheMode) Writing() bool {
-	return m&CacheWrite == CacheWrite
 }
 
 // Snapshotter provides an interface for snapshotting source URL data into
@@ -95,7 +90,7 @@ type EvalConfig struct {
 	// The executor to which execs are submitted.
 	Executor reflow.Executor
 
-	// Scheduler is used to run tasks. Either a scheduler or Executor
+	// Scheduler is used to run tasks. Either a Scheduler or Executor
 	// must be defined. Note that the plan is to deprecate using
 	// executors directly from the evaluator, leaving Scheduler the
 	// only option, and at which time we can simplify some aspects
@@ -104,12 +99,19 @@ type EvalConfig struct {
 	// The scheduler must use the same repository as the evaluator.
 	Scheduler *sched.Scheduler
 
+	// Predictor is used to predict the tasks' resource usage. It
+	// will only be used if a Scheduler is defined.
+	Predictor *predictor.Predictor
+
 	// Snapshotter is used to snapshot source URLs into unloaded
 	// filesets. If non-nil, then files are delay-loaded.
 	Snapshotter Snapshotter
 
 	// An (optional) logger to which the evaluation transcript is printed.
 	Log *log.Logger
+
+	// DotWriter is an (optional) writer where the evaluator will write the flowgraph to in dot format.
+	DotWriter io.Writer
 
 	// Status gets evaluation status reports.
 	Status *status.Group
@@ -128,10 +130,22 @@ type EvalConfig struct {
 	// metadata associations.
 	Assoc assoc.Assoc
 
+	// AssertionGenerator is the implementation for generating assertions.
+	AssertionGenerator reflow.AssertionGenerator
+
+	// Assert is the policy to use for asserting cached Assertions.
+	Assert reflow.Assert
+
+	// TaskDB is the db to which run/tasks information and keepalives are maintained.
+	TaskDB taskdb.TaskDB
+
+	// RunID is a unique identifier for the run
+	RunID taskdb.RunID
+
 	// CacheMode determines whether the evaluator reads from
 	// or writees to the cache. If CacheMode is nonzero, Assoc,
 	// Repository, and Transferer must be non-nil.
-	CacheMode CacheMode
+	CacheMode infra2.CacheMode
 
 	// NoCacheExtern determines whether externs are cached.
 	NoCacheExtern bool
@@ -147,6 +161,9 @@ type EvalConfig struct {
 	// BottomUp determines whether we perform bottom-up only
 	// evaluation, skipping the top-down phase.
 	BottomUp bool
+
+	// PostUseChecksum indicates whether input filesets are checksummed after use.
+	PostUseChecksum bool
 
 	// Config stores the flow config to be used.
 	Config Config
@@ -164,6 +181,9 @@ type EvalConfig struct {
 	// Invalidate is a function that determines whether or not f's cached
 	// results should be invalidated.
 	Invalidate func(f *Flow) bool
+
+	// Labels is the labels for this run.
+	Labels pool.Labels
 }
 
 // String returns a human-readable form of the evaluation configuration.
@@ -177,14 +197,33 @@ func (e EvalConfig) String() string {
 	if e.Snapshotter != nil {
 		fmt.Fprintf(&b, " snapshotter %T", e.Snapshotter)
 	}
-	fmt.Fprintf(&b, " transferer %T", e.Transferer)
+	if e.Transferer != nil {
+		fmt.Fprintf(&b, " transferer %T", e.Transferer)
+	}
+	if e.Repository != nil {
+		repo := fmt.Sprintf("%T", e.Repository)
+		if u := e.Repository.URL(); u != nil {
+			repo += fmt.Sprintf(",url=%s", u)
+		}
+		fmt.Fprintf(&b, " repository %s", repo)
+	}
+	if e.Assoc != nil {
+		fmt.Fprintf(&b, " assoc %s", e.Assoc)
+	}
+	if e.TaskDB != nil {
+		fmt.Fprintf(&b, " taskdb %s", e.TaskDB)
+	}
+	if e.Predictor != nil {
+		fmt.Fprintf(&b, " predictor %T", e.Predictor)
+	}
+
 	var flags []string
 	if e.NoCacheExtern {
 		flags = append(flags, "nocacheextern")
 	} else {
 		flags = append(flags, "cacheextern")
 	}
-	if e.CacheMode == CacheOff {
+	if e.CacheMode == infra2.CacheOff {
 		flags = append(flags, "nocache")
 	} else {
 		if e.CacheMode.Reading() {
@@ -209,6 +248,9 @@ func (e EvalConfig) String() string {
 	} else {
 		flags = append(flags, "topdown")
 	}
+	if e.PostUseChecksum {
+		flags = append(flags, "postusechecksum")
+	}
 	fmt.Fprintf(&b, " flags %s", strings.Join(flags, ","))
 	fmt.Fprintf(&b, " flowconfig %s", e.Config)
 	fmt.Fprintf(&b, " cachelookuptimeout %s", e.CacheLookupTimeout)
@@ -224,12 +266,10 @@ type Eval struct {
 
 	root *Flow
 
-	// The list of Flows available for execution.
-	list []*Flow
-	// The set of completed flows, used for reporting.
-	completed []*Flow
-	// The set of cached flows, used for reporting
-	cached []*Flow
+	// assertions is an accumulation of assertions from computed flows (cache-hit or not)
+	// used to ensure that no two flows can be computed with conflicting assertions.
+	assertions *reflow.Assertions
+
 	// A channel indicating how much extra resources are needed
 	// in order to avoid queueing.
 	needch chan reflow.Requirements
@@ -240,9 +280,7 @@ type Eval struct {
 	// The number of Flows stolen.
 	nstolen int
 	// Contains pending (currently executing) flows.
-	// TODO(marius): encode this into the flow state as well,
-	// so that execution state is not straddled across the two.
-	pending map[*Flow]bool
+	pending *workingset
 
 	// Roots stores the set of roots to be visited in the next
 	// evaluation iteration.
@@ -277,12 +315,20 @@ type Eval struct {
 	muGC                    sync.RWMutex
 	writers                 *writer
 	writersMu               sync.Mutex
+
+	// marshalLimiter is the number concurrent of marshal/unmarshaling of cached filesets to do.
+	// In case of large batch jobs, loading too many of them in parallel causes OOMs,
+	// so we limit how many we load concurrently.
+	// TODO(swami): Better solution is to use a more optimized file format (instead of JSON).
+	marshalLimiter *limiter.Limiter
+
+	flowgraph *simple.DirectedGraph
 }
 
 // NewEval creates and initializes a new evaluator using the provided
 // evaluation configuration and root flow.
 func NewEval(root *Flow, config EvalConfig) *Eval {
-	if (config.Assoc == nil || config.Repository == nil) && config.CacheMode != CacheOff {
+	if (config.Assoc == nil || config.Repository == nil) && config.CacheMode != infra2.CacheOff {
 		switch {
 		case config.Assoc == nil && config.Repository == nil:
 			config.Log.Printf("turning caching off because assoc and repository are not configured")
@@ -291,19 +337,25 @@ func NewEval(root *Flow, config EvalConfig) *Eval {
 		case config.Repository == nil:
 			config.Log.Printf("turning caching off because repository is not configured")
 		}
-		config.CacheMode = CacheOff
+		config.CacheMode = infra2.CacheOff
 	}
 
 	e := &Eval{
-		EvalConfig: config,
-		root:       root.Canonicalize(config.Config),
-		needch:     make(chan reflow.Requirements),
-		errors:     make(chan error),
-		returnch:   make(chan *Flow, 1024),
-		newStealer: make(chan *Stealer),
-		wakeupch:   make(chan bool, 1),
-		pending:    map[*Flow]bool{}, // TODO: name e.ready; but really we should just traverse the tree
+		EvalConfig:     config,
+		root:           root.Canonicalize(config.Config),
+		assertions:     reflow.NewAssertions(),
+		needch:         make(chan reflow.Requirements),
+		errors:         make(chan error),
+		returnch:       make(chan *Flow, 1024),
+		newStealer:     make(chan *Stealer),
+		wakeupch:       make(chan bool, 1),
+		pending:        newWorkingset(),
+		marshalLimiter: limiter.New(),
+		flowgraph:      simple.NewDirectedGraph(),
 	}
+	// Limit the number of concurrent marshal/unmarshal to the number of CPUs we have.
+	e.marshalLimiter.Release(runtime.NumCPU())
+
 	if config.Executor != nil {
 		e.repo = config.Executor.Repository()
 		e.total = config.Executor.Resources()
@@ -410,6 +462,19 @@ func (e *Eval) Err() error {
 // this setup is that the parent must contain some sort of global
 // repository (e.g., S3).
 func (e *Eval) Do(ctx context.Context) error {
+	defer func() {
+		if e.DotWriter != nil {
+			b, err := dot.Marshal(e.flowgraph, fmt.Sprintf("reflow flowgraph %v", e.EvalConfig.RunID.ID()), "", "")
+			if err != nil {
+				e.Log.Debugf("err dot marshal: %v", err)
+				return
+			}
+			_, err = e.DotWriter.Write(b)
+			if err != nil {
+				e.Log.Debugf("err writing dot file: %v", err)
+			}
+		}
+	}()
 	e.Log.Debugf("evaluating with configuration: %s", e.EvalConfig)
 	e.begin = time.Now()
 	defer func() {
@@ -422,8 +487,13 @@ func (e *Eval) Do(ctx context.Context) error {
 
 	root := e.root
 	e.roots.Push(root)
+	e.printDeps(root, false)
 
-	var todo FlowVisitor
+	var (
+		todo  FlowVisitor
+		tasks []*sched.Task // The set of tasks to be submitted after this iteration.
+		flows []*Flow       // The set of flows corresponding to the tasks to be submitted after this iteration.
+	)
 	for root.State != Done {
 		if root.Digest().IsZero() {
 			panic("invalid flow, zero digest: " + root.DebugString())
@@ -443,12 +513,20 @@ func (e *Eval) Do(ctx context.Context) error {
 		e.roots.Reset()
 		e.Trace.Debugf("todo %d from %d roots", len(todo.q), nroots)
 
-		var tasks []*sched.Task // the set of tasks to be submitted after this iteration
+		// LookupFlows consists of all the flows that need to be looked in the cache in this round of flow scheduling.
+		var lookupFlows []*Flow
 	dequeue:
 		for todo.Walk() {
 			f := todo.Flow
-			if e.pending[f] {
+			e.printDeps(f, true)
+			if e.pending.Pending(f) {
 				continue
+			}
+			switch f.Op {
+			case Exec, Intern, Extern:
+				if !f.TaskID.IsValid() {
+					f.TaskID = taskdb.NewTaskID()
+				}
 			}
 			if f.Op == Exec {
 				if f.Resources["mem"] < minExecMemory {
@@ -465,10 +543,11 @@ func (e *Eval) Do(ctx context.Context) error {
 				}
 			}
 			if e.Snapshotter != nil && f.Op == Intern && (f.State == Ready || f.State == NeedTransfer) && !f.MustIntern {
-				e.Mutate(f, Running)
-				e.pending[f] = true
+				// In this case we don't display status, since we're not doing
+				// any appreciable work here, and it's confusing to the user.
+				e.Mutate(f, Running, NoStatus)
+				e.pending.Add(f)
 				e.step(f, func(f *Flow) error {
-					e.Log.Debugf("snapshot %s", f.URL)
 					fs, err := e.Snapshotter.Snapshot(ctx, f.URL.String())
 					if err != nil {
 						e.Log.Printf("must intern %q: resolve: %v", f.URL, err)
@@ -486,6 +565,10 @@ func (e *Eval) Do(ctx context.Context) error {
 					// submit directly to the scheduler.
 					e.Mutate(f, NeedSubmit)
 				}
+			} else if f.Op.External() && f.MustIntern {
+				// TODO(pgopal/swami): Remove this (see https://phabricator.grailbio.com/D45057).
+				// This check was adedd to ensure MustIntern flows work properly in evaluator mode.
+				e.Mutate(f, Ready)
 			}
 
 			switch f.State {
@@ -494,14 +577,11 @@ func (e *Eval) Do(ctx context.Context) error {
 				// as the underyling APIs (e.g., to DynamoDB) do not
 				// bundle requests automatically.
 				e.Mutate(f, Lookup)
-				e.pending[f] = true
-				e.step(f, func(f *Flow) error {
-					e.lookup(ctx, f)
-					return nil
-				})
+				e.pending.Add(f)
+				lookupFlows = append(lookupFlows, f)
 			case NeedTransfer:
 				e.Mutate(f, Transfer)
-				e.pending[f] = true
+				e.pending.Add(f)
 				e.step(f, func(f *Flow) error {
 					files, err := e.needTransfer(ctx, f)
 					if err != nil {
@@ -515,13 +595,14 @@ func (e *Eval) Do(ctx context.Context) error {
 					// this is of course subject to race conditions: when multiple
 					// execs concurrently require the same objects, these may be
 					// reported multiple times in aggregate transfer size.
-					seen := make(map[reflow.File]bool)
+					seen := make(map[digest.Digest]bool)
 					for _, file := range files {
-						if seen[file] {
+						dig := file.Digest()
+						if seen[dig] {
 							continue
 						}
 						f.TransferSize += data.Size(file.Size)
-						seen[file] = true
+						seen[dig] = true
 					}
 					e.Mutate(f, Refresh) // TransferSize is updated
 					e.LogFlow(ctx, f)
@@ -539,8 +620,12 @@ func (e *Eval) Do(ctx context.Context) error {
 					continue dequeue
 				}
 				e.available.Sub(e.available, f.Resources)
-				e.Mutate(f, Running, Reserve(f.Resources))
-				e.pending[f] = true
+				state := Running
+				if f.Op.External() {
+					state = Execing
+				}
+				e.Mutate(f, state, Reserve(f.Resources))
+				e.pending.Add(f)
 				e.step(f, func(f *Flow) error { return e.eval(ctx, f) })
 			case NeedSubmit:
 				var err *errors.Error
@@ -551,9 +636,7 @@ func (e *Eval) Do(ctx context.Context) error {
 						break
 					}
 				}
-
-				e.Mutate(f, Running, Reserve(f.Resources))
-				e.pending[f] = true
+				e.pending.Add(f)
 				if err != nil {
 					go func(err *errors.Error) {
 						e.Mutate(f, err, Done)
@@ -561,28 +644,35 @@ func (e *Eval) Do(ctx context.Context) error {
 					}(err)
 					break
 				}
-
-				task := sched.NewTask()
-				task.ID = f.Digest()
-				task.Config = f.ExecConfig()
-				task.Log = e.Log.Prefixf("task %s: ", f.Digest().Short())
+				e.Mutate(f, Execing, Reserve(f.Resources))
+				task := e.newTask(f)
 				tasks = append(tasks, task)
+				flows = append(flows, f)
 				e.step(f, func(f *Flow) error {
-					if err := task.Wait(ctx, sched.TaskRunning); err != nil {
+					if err := e.taskWait(ctx, f, task); err != nil {
 						return err
 					}
-					// Grab the task's exec so that it can be logged properly.
-					f.Exec = task.Exec
-					e.LogFlow(ctx, f)
-					if err := task.Wait(ctx, sched.TaskDone); err != nil {
-						return err
+					// The Predictor can lower a task's memory requirements and cause a non-OOM memory error. This is
+					// because the linux OOM killer does not catch all OOM errors. In order to prevent such an error from
+					// causing a reflow program to fail, assume that if the Predictor lowers the memory of a task and
+					// that task returns a non-OOM error, the task should be retried with its original resources.
+					if task.Result.Err != nil && !errors.Is(errors.OOM, task.Result.Err) && f.Reserved["mem"] < f.Resources["mem"] {
+						var err error
+						if task, err = e.retryTask(ctx, f, f.Resources, "Predictor", "default resources"); err != nil {
+							return err
+						}
 					}
-					if task.Err != nil {
-						e.Mutate(f, task.Err, Done)
-					} else {
-						e.Mutate(f, task.Result.Err, task.Result.Fileset, Done)
+					// Retry OOMs if needed.
+					for retries := 0; retries < maxOOMRetries && task.Result.Err != nil && errors.Is(errors.OOM, task.Result.Err); retries++ {
+						resources := oomAdjust(f.Resources, task.Config.Resources)
+						msg := fmt.Sprintf("%v of memory (%v/%v)", data.Size(resources["mem"]), retries+1, maxOOMRetries)
+						var err error
+						if task, err = e.retryTask(ctx, f, resources, "OOM", msg); err != nil {
+							return err
+						}
 					}
-					if e.CacheMode.Writing() {
+					// Write to the cache only if a task was successfully completed.
+					if e.CacheMode.Writing() && task.Err == nil && task.Result.Err == nil {
 						e.Mutate(f, Incr) // just so the cache write can decr it
 						e.cacheWriteAsync(ctx, f)
 					}
@@ -590,14 +680,25 @@ func (e *Eval) Do(ctx context.Context) error {
 				})
 			}
 		}
-		if e.Scheduler != nil && len(tasks) > 0 {
+		if len(lookupFlows) > 0 {
+			go e.batchLookup(ctx, lookupFlows...)
+		}
+		// Delay task submission until we have gathered all potential tasks
+		// that can be scheduled concurrently. This is represented by the
+		// set of tasks that are currently either performing cache lookups
+		// (Lookup) or else are undergoing local evaluation (Running). This
+		// helps the scheduler better allocate underlying resources since
+		// we always submit the largest available working set.
+		if e.Scheduler != nil && len(tasks) > 0 && e.pending.NState(Lookup)+e.pending.NState(Running) == 0 {
+			e.reviseResources(ctx, tasks, flows)
 			e.Scheduler.Submit(tasks...)
 			tasks = tasks[:0]
+			flows = flows[:0]
 		}
 		if root.State == Done {
 			break
 		}
-		if len(e.pending) == 0 && root.State != Done {
+		if e.pending.N() == 0 && root.State != Done {
 			var states [Max][]*Flow
 			for v := e.root.Visitor(); v.Walk(); v.Visit() {
 				states[v.State] = append(states[v.State], v.Flow)
@@ -607,7 +708,7 @@ func (e *Eval) Do(ctx context.Context) error {
 				n, tasks := accumulate(states[i])
 				s[i] = fmt.Sprintf("%s:%d<%s>", State(i).Name(), n, tasks)
 			}
-			e.Log.Printf("pending %d", len(e.pending))
+			e.Log.Printf("pending %d", e.pending.N())
 			e.Log.Printf("eval %s", strings.Join(s[:], " "))
 			panic("scheduler is stuck")
 		}
@@ -622,7 +723,7 @@ func (e *Eval) Do(ctx context.Context) error {
 	if root.Err != nil {
 		return nil
 	}
-	for len(e.pending) > 0 {
+	for e.pending.N() > 0 {
 		if err := e.wait(ctx); err != nil {
 			return err
 		}
@@ -643,6 +744,7 @@ func (e *Eval) LogSummary(log *log.Logger) {
 		Runtime                 stats
 		CPU, Memory, Disk, Temp stats
 		Transfer                data.Size
+		Requested               reflow.Resources
 	}
 	stats := map[string]aggregate{}
 
@@ -677,9 +779,10 @@ func (e *Eval) LogSummary(log *log.Logger) {
 		}
 		if v.Op == Exec {
 			a.CPU.Add(v.Inspect.Profile["cpu"].Mean)
-			a.Memory.Add(v.Inspect.Profile["mem"].Max / (1 << 30))
-			a.Disk.Add(v.Inspect.Profile["disk"].Max / (1 << 30))
-			a.Temp.Add(v.Inspect.Profile["tmp"].Max / (1 << 30))
+			a.Memory.Add(v.Inspect.Profile["mem"].Max)
+			a.Disk.Add(v.Inspect.Profile["disk"].Max)
+			a.Temp.Add(v.Inspect.Profile["tmp"].Max)
+			a.Requested = v.Inspect.Config.Resources
 		}
 		if d := v.Inspect.Runtime().Minutes(); d > 0 {
 			a.Runtime.Add(d)
@@ -694,21 +797,37 @@ func (e *Eval) LogSummary(log *log.Logger) {
 	fmt.Fprintf(&b, "total n=%d time=%s\n", n, round(e.totalTime))
 	var tw tabwriter.Writer
 	tw.Init(newPrefixWriter(&b, "\t"), 4, 4, 1, ' ', 0)
-	fmt.Fprintln(&tw, "ident\tn\tncache\ttransfer\truntime(m)\tcpu\tmem(GiB)\tdisk(GiB)\ttmp(GiB)")
-	for ident, stats := range stats {
+	fmt.Fprintln(&tw, "ident\tn\tncache\ttransfer\truntime(m)\tcpu\tmem(GiB)\tdisk(GiB)\ttmp(GiB)\trequested")
+	idents := make([]string, 0, len(stats))
+	for ident := range stats {
+		idents = append(idents, ident)
+	}
+	sort.Strings(idents)
+	var warningIdents []string
+	const byteScale = 1.0 / (1 << 30)
+	for _, ident := range idents {
+		stats := stats[ident]
 		fmt.Fprintf(&tw, "%s\t%d\t%d\t%s", ident, stats.N, stats.Ncache, stats.Transfer)
 		if stats.CPU.N() > 0 {
-			fmt.Fprintf(&tw, "\t%s\t%s\t%s\t%s\t%s",
+			fmt.Fprintf(&tw, "\t%s\t%s\t%s\t%s\t%s\t%s",
 				stats.Runtime.Summary("%.0f"),
 				stats.CPU.Summary("%.1f"),
-				stats.Memory.Summary("%.1f"),
-				stats.Disk.Summary("%.1f"),
-				stats.Temp.Summary("%.1f"),
+				stats.Memory.SummaryScaled("%.1f", byteScale),
+				stats.Disk.SummaryScaled("%.1f", byteScale),
+				stats.Temp.SummaryScaled("%.1f", byteScale),
+				stats.Requested,
 			)
+			reqMem, minMem := stats.Requested["mem"], float64(minExecMemory)
+			if memRatio := stats.Memory.Mean() / reqMem; memRatio <= memSuggestThreshold && reqMem > minMem {
+				warningIdents = append(warningIdents, ident)
+			}
 		} else {
 			fmt.Fprint(&tw, "\t\t\t\t\t")
 		}
 		fmt.Fprint(&tw, "\n")
+	}
+	if len(warningIdents) > 0 {
+		fmt.Fprintf(&tw, "warning: reduce memory requirements for over-allocating execs: %s", strings.Join(warningIdents, ", "))
 	}
 	tw.Flush()
 	log.Printf(b.String())
@@ -799,7 +918,7 @@ func (e *Eval) wait(ctx context.Context) (err error) {
 		)
 		for v := e.root.Visitor(); v.Walk(); {
 			switch {
-			case e.pending[v.Flow]:
+			case e.pending.Pending(v.Flow):
 				if v.State == Transfer {
 					nrunning++
 				} else {
@@ -816,7 +935,7 @@ func (e *Eval) wait(ctx context.Context) (err error) {
 				admitted := false
 				for s := e.stealer; s != nil; s = s.next {
 					if admitted = s.admit(v.Flow); admitted {
-						e.pending[v.Flow] = true
+						e.pending.Add(v.Flow)
 						e.nstolen++
 						break
 					}
@@ -871,7 +990,7 @@ func (e *Eval) reportStatus() {
 		case Transfer:
 			byteCounts.Incr(v.State, v.Ident, int(v.TransferSize))
 			fallthrough
-		case Ready, Done, TODO, Running:
+		case Ready, Done, TODO, Running, Execing:
 			stateCounts.Incr(v.State, v.Ident, 1)
 		}
 	}
@@ -888,7 +1007,7 @@ func (e *Eval) reportStatus() {
 		dur = fmt.Sprintf("%dh%dm", int(elapsed.Hours()), int(elapsed.Minutes()-60*elapsed.Hours()))
 	}
 	fmt.Fprintf(&b, "elapsed: %s", dur)
-	for _, state := range []State{Running, Transfer, Ready} {
+	for _, state := range []State{Execing, Running, Transfer, Ready} {
 		n := stateCounts.N(state)
 		if n == 0 {
 			continue
@@ -897,12 +1016,12 @@ func (e *Eval) reportStatus() {
 	}
 	fmt.Fprintf(&b, ", completed: %d/%d",
 		stateCounts.N(Done),
-		stateCounts.N(Done)+stateCounts.N(Running)+stateCounts.N(Transfer)+stateCounts.N(TODO))
+		stateCounts.N(Done)+stateCounts.N(Execing)+stateCounts.N(Running)+stateCounts.N(Transfer)+stateCounts.N(TODO))
 	e.Status.Print(b.String())
 }
 
 func (e *Eval) returnFlow(f *Flow) {
-	delete(e.pending, f)
+	e.pending.Done(f)
 	switch f.State {
 	case Done:
 		for _, flow := range f.Dirty {
@@ -923,7 +1042,7 @@ func (e *Eval) returnFlow(f *Flow) {
 	}
 }
 
-// collect reclaims unreachable objects from the executor's repository.
+// Collect reclaims unreachable objects from the executor's repository.
 // Objects are considered live if:
 //
 //	(1) They are part of the frontier of flow nodes in Done state.
@@ -1023,7 +1142,7 @@ func (e *Eval) collect(ctx context.Context) {
 	e.live = live
 }
 
-// dirty determines whether node f is (transitively) dirty, and must
+// Dirty determines whether node f is (transitively) dirty, and must
 // be recomputed. Dirty considers only visible nodes; it does not
 // incur extra computation, thus dirtying does not work when dirtying
 // nodes are hidden behind maps, continuations, or coercions.
@@ -1042,7 +1161,7 @@ func (e *Eval) dirty(f *Flow) bool {
 	return false
 }
 
-// valid tells whether f's cached results should be considered valid.
+// Valid tells whether f's cached results should be considered valid.
 func (e *Eval) valid(f *Flow) bool {
 	if e.Invalidate == nil {
 		return true
@@ -1054,11 +1173,18 @@ func (e *Eval) valid(f *Flow) bool {
 	return !invalid
 }
 
-// todo adds to e.list the set of ready Flows in f. Todo adds all nodes
+// Todo adds to e.list the set of ready Flows in f. Todo adds all nodes
 // that require evaluation to the provided visitor.
 func (e *Eval) todo(f *Flow, visited flowOnce, v *FlowVisitor) {
 	if f == nil || !visited.Visit(f) {
 		return
+	}
+	for _, dep := range f.Deps {
+		if dep.ExecDepIncorrectCacheKeyBug {
+			// If the dependency was affected by the bug, then so is the parent.
+			f.ExecDepIncorrectCacheKeyBug = true
+			break
+		}
 	}
 	switch f.State {
 	case Init:
@@ -1106,7 +1232,7 @@ func (e *Eval) todo(f *Flow, visited flowOnce, v *FlowVisitor) {
 		case Intern, Exec, Extern:
 			// We're ready to run. If we're in bottom up mode, this means we're ready
 			// for our cache lookup.
-			if e.BottomUp {
+			if e.BottomUp && e.CacheMode.Reading() {
 				e.Mutate(f, NeedLookup)
 			} else {
 				if e.CacheMode.Reading() {
@@ -1126,7 +1252,16 @@ func (e *Eval) todo(f *Flow, visited flowOnce, v *FlowVisitor) {
 	}
 }
 
-// eval performs a one-step simplification of f. It must be called
+type kCtx struct {
+	context.Context
+	repo reflow.Repository
+}
+
+func (k kCtx) Repository() reflow.Repository {
+	return k.repo
+}
+
+// Eval performs a one-step simplification of f. It must be called
 // only after all of f's dependencies are ready.
 //
 // eval also caches results of successful execs if e.Cache is defined.
@@ -1157,7 +1292,7 @@ func (e *Eval) eval(ctx context.Context, f *Flow) (err error) {
 						e.Log.Errorf("eval %s runtime error: %v", f.ExecString(false), err)
 					}
 				*/
-			} else if f.State == Done && f.Op != K && f.Op != Coerce {
+			} else if f.State == Done && f.Op != K && f.Op != Kctx && f.Op != Coerce {
 				f.Runtime = time.Since(begin)
 			}
 		}()
@@ -1172,7 +1307,7 @@ func (e *Eval) eval(ctx context.Context, f *Flow) (err error) {
 		case Intern:
 			name = fmt.Sprintf("intern %s", f.URL)
 		case Exec:
-			name = fmt.Sprintf("exec %s", abbrevCmd(f))
+			name = fmt.Sprintf("exec %s", f.AbbrevCmd())
 		}
 		ctx, done := trace.Start(ctx, trace.Exec, f.Digest(), name)
 		trace.Note(ctx, "ident", f.Ident)
@@ -1248,7 +1383,16 @@ func (e *Eval) eval(ctx context.Context, f *Flow) (err error) {
 		for i, dep := range f.Deps {
 			vs[i] = dep.Value
 		}
+
 		ff := f.K(vs)
+		e.Mutate(f, Fork(ff), Init)
+		e.Mutate(f.Parent, Done)
+	case Kctx:
+		vs := make([]values.T, len(f.Deps))
+		for i, dep := range f.Deps {
+			vs[i] = dep.Value
+		}
+		ff := f.Kctx(kCtx{ctx, e.repo}, vs)
 		e.Mutate(f, Fork(ff), Init)
 		e.Mutate(f.Parent, Done)
 	case Coerce:
@@ -1271,6 +1415,12 @@ func (e *Eval) eval(ctx context.Context, f *Flow) (err error) {
 		}
 	default:
 		panic(fmt.Sprintf("bug %v", f))
+	}
+	switch f.Op {
+	case Intern, Extern, Exec:
+		if e.TaskDB != nil {
+			e.taskdbWriteAsync(ctx, f.Op, f.Inspect, f.Exec, f.TaskID)
+		}
 	}
 	if !e.CacheMode.Writing() {
 		e.Mutate(f, Decr)
@@ -1318,60 +1468,18 @@ func (e *Eval) CacheWrite(ctx context.Context, f *Flow, repo reflow.Repository) 
 	if err := e.Transferer.Transfer(ctx, e.Repository, repo, fs.Files()...); err != nil {
 		return err
 	}
+	_ = e.marshalLimiter.Acquire(ctx, 1)
 	id, err := marshal(ctx, e.Repository, fs)
+	e.marshalLimiter.Release(1)
 	if err != nil {
 		return err
 	}
-	pid := digest.Digest{}
-	var stdout, stderr digest.Digest
-	if f.Op == Exec {
-		b := new(bytes.Buffer)
-		enc := json.NewEncoder(b)
-		if err = enc.Encode(f.Inspect); err == nil {
-			if pid, err = e.Repository.Put(ctx, b); err != nil {
-				log.Errorf("repository put profile: %v", err)
-			}
-		} else {
-			log.Errorf("encoder marshal profile: %v", err)
-		}
-		if f.Exec != nil {
-			if rc, err := f.Exec.Logs(ctx, true, false, false); err == nil {
-				if stdout, err = e.Repository.Put(ctx, rc); err != nil {
-					log.Errorf("repository put stdout: %v", err)
-				}
-				rc.Close()
-			}
-			if rc, err := f.Exec.Logs(ctx, false, true, false); err == nil {
-				if stderr, err = e.Repository.Put(ctx, rc); err != nil {
-					log.Errorf("repository put stderr: %v", err)
-				}
-				rc.Close()
-			}
-		}
-	}
-
 	// Write a mapping for each cache key.
 	g, ctx := errgroup.WithContext(ctx)
 	for i := range keys {
 		key := keys[i]
 		g.Go(func() error {
-			err := e.Assoc.Store(ctx, assoc.Fileset, key, id)
-			if !pid.IsZero() {
-				if err := e.Assoc.Store(ctx, assoc.ExecInspect, key, pid); err != nil {
-					log.Errorf("assoc store execinspect: %v", err)
-				}
-			}
-			if !stdout.IsZero() {
-				if err := e.Assoc.Store(ctx, assoc.Logs, key, stdout); err != nil {
-					log.Errorf("assoc store stdout: %v", err)
-				}
-			}
-			if !stderr.IsZero() {
-				if err := e.Assoc.Store(ctx, assoc.Logs, key, stderr); err != nil {
-					log.Errorf("assoc store stderr: %v", err)
-				}
-			}
-			return err
+			return e.Assoc.Store(ctx, assoc.Fileset, key, id)
 		})
 	}
 	return g.Wait()
@@ -1386,6 +1494,58 @@ func (e *Eval) cacheWriteAsync(ctx context.Context, f *Flow) {
 		}
 		bgctx.Complete()
 		e.Mutate(f, Decr)
+	}()
+}
+
+func (e *Eval) taskdbWrite(ctx context.Context, op Op, inspect reflow.ExecInspect, exec reflow.Exec, id taskdb.TaskID) error {
+	if !op.External() {
+		return nil
+	}
+	var (
+		err            error
+		stdout, stderr digest.Digest
+		pid            digest.Digest
+	)
+	g, ctx := errgroup.WithContext(ctx)
+	if pid, err = marshal(ctx, e.Repository, inspect); err != nil {
+		log.Errorf("repository put profile: %v", err)
+	}
+	if exec != nil {
+		if rc, err := exec.Logs(ctx, true, false, false); err == nil {
+			if stdout, err = e.Repository.Put(ctx, rc); err != nil {
+				log.Errorf("repository put stdout: %v", err)
+			}
+			rc.Close()
+		}
+		if rc, err := exec.Logs(ctx, false, true, false); err == nil {
+			if stderr, err = e.Repository.Put(ctx, rc); err != nil {
+				log.Errorf("repository put stderr: %v", err)
+			}
+			rc.Close()
+		}
+	}
+	if e.TaskDB != nil {
+		g.Go(func() error {
+			err := e.TaskDB.SetTaskAttrs(ctx, id, stdout, stderr, pid)
+			if err != nil {
+				e.Log.Debugf("taskdb settaskattrs: %v", err)
+			}
+			return nil
+		})
+	}
+	return g.Wait()
+}
+
+// TODO(dnicolaou): Change to: taskdbWriteAsync(ctx context.Context, op Op, task *sched.Task) once nonscheduler mode is
+// removed.
+func (e *Eval) taskdbWriteAsync(ctx context.Context, op Op, inspect reflow.ExecInspect, exec reflow.Exec, id taskdb.TaskID) {
+	bgctx := Background(ctx)
+	go func() {
+		err := e.taskdbWrite(bgctx, op, inspect, exec, id)
+		if err != nil {
+			e.Log.Errorf("taskdb write %v: %v", id, err)
+		}
+		bgctx.Complete()
 	}()
 }
 
@@ -1404,106 +1564,225 @@ func (e *Eval) lookupFailed(f *Flow) {
 	}
 }
 
-// lookup performs a cache lookup of node f.
-func (e *Eval) lookup(ctx context.Context, f *Flow) {
-	if !e.valid(f) || !e.CacheMode.Reading() || e.NoCacheExtern && (f.Op == Extern || f == e.root) {
-		e.lookupFailed(f)
-		return
-	}
-	var (
-		keys = f.CacheKeys()
-		fs   reflow.Fileset
-		fsid digest.Digest
-		err  error
-	)
-	if len(keys) == 0 {
-		// This can't be true now, but in the future it could be valid for nodes
-		// to present no cache keys.
-		e.lookupFailed(f)
-		return
-	}
-	which := -1
-	// The assoc lookups can produce a very high rate of lookups, especially
-	// when restarting large workflows. This is exacerbated by the fact that
-	// we don't perform batch lookups, and also perform "blind" read-repair:
-	// since we don't know which keys are missing, we write back all of the
-	// candidates. Here, the former would alleviate the latter.
-	//
-	// For now, we have the band-aids of concurrency limiting and large
-	// timeouts.
-	//
-	// TODO(marius): push multiple lookups into the assoc,
-	// so that these requests can be batched underneath,
-	// then perform precise read repair.
-	for i, key := range keys {
-		ctx, cancel := context.WithTimeout(ctx, e.CacheLookupTimeout)
-		key, fsid, err = e.Assoc.Get(ctx, assoc.Fileset, key)
-		cancel()
-		if err != nil {
-			if !errors.Is(errors.NotExist, err) {
-				e.Log.Errorf("assoc.Get %v: %v", f, err)
-			}
+// BatchLookup performs a cache lookup of a set of flow nodes.
+func (e *Eval) batchLookup(ctx context.Context, flows ...*Flow) {
+	batch := make(assoc.Batch)
+	for _, f := range flows {
+		if !e.valid(f) || !e.CacheMode.Reading() || e.NoCacheExtern && (f.Op == Extern || f == e.root) {
+			e.lookupFailed(f)
 			continue
 		}
-		err = unmarshal(ctx, e.Repository, fsid, &fs)
-		if err == nil {
-			which = i
-			break
+		keys := f.CacheKeys()
+		if len(keys) == 0 {
+			// This can't be true now, but in the future it could be valid for nodes
+			// to present no cache keys.
+			e.lookupFailed(f)
+			continue
 		}
-		if !errors.Is(errors.NotExist, err) {
-			e.Log.Errorf("unmarshal %v: %v", fsid, err)
+		for _, key := range keys {
+			batch.Add(assoc.Key{assoc.Fileset, key})
 		}
-	}
-	// Nothing was found, so there is no read repair to do.
-	// Fail the lookup early.
-	if which < 0 {
-		e.lookupFailed(f)
-		return
-	}
-	// Make sure all of the files are present in the repository.
-	// If they are not, we consider this a cache miss.
-	missing, err := missing(ctx, e.Repository, fs.Files()...)
-	switch {
-	case err != nil:
-		if err != ctx.Err() {
-			e.Log.Errorf("missing %v: %v", fs, err)
-		}
-	case len(missing) != 0:
-		var total int64
-		for _, file := range missing {
-			total += file.Size
-		}
-		err = errors.E(
-			errors.NotExist, "cache.Lookup",
-			errors.Errorf("missing %d files (%s)", len(missing), data.Size(total)))
-	}
-	if err == nil && e.RecomputeEmpty && fs.AnyEmpty() {
-		e.Log.Debugf("recomputing empty value for %v", f)
-	} else if err == nil {
-		// Perform read repair: asynchronously write back all of the other
-		// keys (which are synonymous by definition).
-		keys = append(keys[:which], keys[which+1:]...)
-		bgctx := Background(ctx)
-		go func() {
-			for _, key := range keys {
-				if err := e.Assoc.Store(bgctx, assoc.Fileset, key, fsid); err != nil {
-					if !errors.Is(errors.Precondition, err) {
-						e.Log.Errorf("assoc write for read repair %v %v: %v", f, key, err)
+		if e.Log.At(log.DebugLevel) {
+			e.Log.Debugf("cache.Lookup flow: %s (%s) keys: %s\n", f.Digest().Short(), f.Ident, strings.Join(
+				func() []string {
+					strs := make([]string, len(keys))
+					for i, key := range keys {
+						strs[i] = key.Short()
 					}
+					return strs
+				}(), ", "))
+		}
+	}
+	{
+		ctx, cancel := context.WithTimeout(ctx, e.CacheLookupTimeout)
+		err := e.Assoc.BatchGet(ctx, batch)
+		cancel()
+		if err != nil {
+			e.Log.Errorf("assoc.BatchGet: %v", err)
+			for _, f := range flows {
+				e.step(f, func(f *Flow) error {
+					e.lookupFailed(f)
+					return nil
+				})
+			}
+			return
+		}
+	}
+	bg := e.newAssertionsBatchCache()
+	for _, f := range flows {
+		e.step(f, func(f *Flow) error {
+			var (
+				keys = f.CacheKeys()
+				fs   reflow.Fileset
+				fsid digest.Digest
+				err  error
+			)
+			for _, key := range keys {
+				res, ok := batch[assoc.Key{Kind: assoc.Fileset, Digest: key}]
+				if !ok || res.Digest.IsZero() || res.Error != nil {
+					if ok && res.Error != nil {
+						e.Log.Errorf("assoc.BatchGet: %v %v", key, res.Error)
+					}
+					continue
+				}
+				_ = e.marshalLimiter.Acquire(ctx, 1)
+				err = unmarshal(ctx, e.Repository, res.Digest, &fs)
+				e.marshalLimiter.Release(1)
+				if err == nil {
+					e.Log.Debugf("cache.Lookup flow: %s (%s) result from key: %s, value: %s\n", f.Digest().Short(), f.Ident, key.Short(), res.Digest)
+					fsid = res.Digest
+					break
+				}
+				if !errors.Is(errors.NotExist, err) {
+					e.Log.Errorf("unmarshal %v: %v", res.Digest, err)
 				}
 			}
-			bgctx.Complete()
-		}()
-		// The node is marked done. If the needed objects are not later
-		// found in the cache's repository, the node will be marked for
-		// recomputation.
-		e.Mutate(f, fs, Cached, Done)
-		if e.BottomUp {
-			e.LogFlow(ctx, f)
-		}
-		return
+			// Nothing was found, so there is no read repair to do.
+			// Fail the lookup early.
+			if fsid.IsZero() {
+				e.lookupFailed(f)
+				return nil
+			}
+			// Make sure all of the files are present in the repository.
+			// If they are not, we consider this a cache miss.
+			missing, err := missing(ctx, e.Repository, fs.Files()...)
+			switch {
+			case err != nil:
+				if err != ctx.Err() {
+					e.Log.Errorf("missing %v: %v", fs, err)
+				}
+			case len(missing) != 0:
+				var total int64
+				for _, file := range missing {
+					total += file.Size
+				}
+				err = errors.E(
+					errors.NotExist, "cache.Lookup",
+					errors.Errorf("missing %d files (%s)", len(missing), data.Size(total)))
+			}
+			if err != nil {
+				e.lookupFailed(f)
+				return nil
+			}
+			// If the cached fileset has viable non-empty assertions, assert them.
+			if a, size := reflow.NonEmptyAssertions(fs.Assertions()...); size > 0 {
+				// Check if the assertions are internally consistent for the cached fileset.
+				if err = e.assertionsConsistent(f, a); err != nil {
+					e.Log.Debugf("assertions consistent: %v", err)
+					e.lookupFailed(f)
+					return nil
+				}
+				anew, err := e.refreshAssertions(ctx, a, bg)
+				if err != nil {
+					e.Log.Debugf("refresh assertions: %v", err)
+					e.lookupFailed(f)
+					return nil
+				}
+				if !e.Assert(ctx, a, anew) {
+					if e.Log.At(log.DebugLevel) {
+						if diff := reflow.PrettyDiff(a, anew); diff != "" {
+							e.Log.Debugf("flow %s assertions diff:\n%s\n", f.Digest().Short(), diff)
+						}
+					}
+					e.lookupFailed(f)
+					return nil
+				}
+			}
+			if e.RecomputeEmpty && fs.AnyEmpty() {
+				e.Log.Debugf("recomputing empty value for %v", f)
+				e.lookupFailed(f)
+				return nil
+			}
+			// Perform read repair: asynchronously write back all non existent keys.
+			writeback := keys[:0]
+			for _, key := range keys {
+				if res, ok := batch[assoc.Key{Kind: assoc.Fileset, Digest: key}]; !ok || res.Digest.IsZero() || res.Error != nil {
+					writeback = append(writeback, key)
+				}
+			}
+			bgctx := Background(ctx)
+			go func() {
+				for _, key := range writeback {
+					if err := e.Assoc.Store(bgctx, assoc.Fileset, key, fsid); err != nil {
+						if !errors.Is(errors.Precondition, err) {
+							e.Log.Errorf("assoc write for read repair %v %v: %v", f, key, err)
+						}
+					}
+				}
+				bgctx.Complete()
+			}()
+			// The node is marked done. If the needed objects are not later
+			// found in the cache's repository, the node will be marked for
+			// recomputation.
+			e.Mutate(f, fs, Cached, Done)
+			if e.BottomUp {
+				e.LogFlow(ctx, f)
+			}
+			return nil
+		})
 	}
-	e.lookupFailed(f)
+}
+
+// assertionsBatchCache supports caching generated assertions in a batch.
+type assertionsBatchCache struct {
+	ag reflow.AssertionGenerator
+	o  once.Map
+	m  sync.Map // map[reflow.AssertionKey]*reflow.Assertions
+}
+
+func (e *Eval) newAssertionsBatchCache() *assertionsBatchCache {
+	return &assertionsBatchCache{ag: e.AssertionGenerator}
+}
+
+// Generate calls the given AssertionGenerator with the given reflow.AssertionKey.
+func (g *assertionsBatchCache) Generate(ctx context.Context, ak reflow.AssertionKey) (*reflow.Assertions, error) {
+	err := g.o.Do(ak, func() error {
+		assertions, err := g.ag.Generate(ctx, ak)
+		if err != nil {
+			return err
+		}
+		g.m.Store(ak, assertions)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	v, _ := g.m.Load(ak)
+	return v.(*reflow.Assertions), nil
+}
+
+// refreshAssertions returns assertions with current properties for each subject in the given assertions.
+// If provided, the assertionsBatchCache will be used to generate/cache assertions when necessary.
+// For each subject, the current value is computed:
+// - from the assertions (if it exists)
+// - by invoking assertion generators directly or fetching from the assertionsBatchCache (if provided)
+func (e *Eval) refreshAssertions(ctx context.Context, list []*reflow.Assertions, bg *assertionsBatchCache) ([]*reflow.Assertions, error) {
+	var refreshed []*reflow.Assertions
+	var toGenerate []reflow.AssertionKey
+	for _, a := range list {
+		newA, missing := e.assertions.Filter(a)
+		refreshed = append(refreshed, newA)
+		toGenerate = append(toGenerate, missing...)
+	}
+	if len(toGenerate) == 0 {
+		refreshed, _ = reflow.NonEmptyAssertions(refreshed...)
+		return refreshed, nil
+	}
+	genAs := make([]*reflow.Assertions, len(toGenerate))
+	if err := traverse.Each(len(toGenerate), func(i int) error {
+		var err error
+		if bg != nil {
+			genAs[i], err = bg.Generate(ctx, toGenerate[i])
+		} else {
+			genAs[i], err = e.AssertionGenerator.Generate(ctx, toGenerate[i])
+		}
+		return err
+	}); err != nil {
+		return nil, err
+	}
+	refreshed = append(refreshed, genAs...)
+	refreshed, _ = reflow.NonEmptyAssertions(refreshed...)
+	return refreshed, nil
 }
 
 // needTransfer returns the file objects that require transfer from flow f.
@@ -1532,7 +1811,7 @@ func (e *Eval) transfer(ctx context.Context, f *Flow) error {
 	case Extern:
 		name = fmt.Sprintf("xfer extern %s %s", f.URL, data.Size(f.Deps[0].Value.(reflow.Fileset).Size()))
 	case Exec:
-		name = fmt.Sprintf("xfer exec %s", abbrevCmd(f))
+		name = fmt.Sprintf("xfer exec %s", f.AbbrevCmd())
 	}
 
 	ctx, done := trace.Start(ctx, trace.Transfer, f.Digest(), name)
@@ -1551,6 +1830,53 @@ func (e *Eval) transfer(ctx context.Context, f *Flow) error {
 	return errors.E(errors.Unavailable, "cache.Transfer", err)
 }
 
+// assignExecId assigns an Exec ID appropriate for the given Flow
+// by merging its digest with the assertions it depends on.
+func (e *Eval) assignExecId(ctx context.Context, f *Flow) error {
+	as, err := e.refreshAssertions(ctx, f.depAssertions(), nil)
+	if err != nil {
+		return errors.E("AssignExecID", f.Digest(), err)
+	}
+	state, err := reflow.MergeAssertions(as...)
+	if err != nil {
+		return errors.E("AssignExecID", f.Digest(), err)
+	}
+	f.ExecId = reflow.Digester.FromDigests(f.Digest(), state.Digest())
+	return nil
+}
+
+// assertionsConsistent checks whether the given set of assertions
+// are consistent with the given flow's dependencies.
+//
+// assertionsConsistent is valid only for Intern, Extern, and Exec ops
+// and should be called only after the flow's dependencies
+// are done, for it to return a meaningful result.
+func (e *Eval) assertionsConsistent(f *Flow, list []*reflow.Assertions) error {
+	if !f.Op.External() {
+		return nil
+	}
+	// Add assertions of dependencies of flow.
+	as := f.depAssertions()
+	as = append(as, list...)
+	_, err := reflow.MergeAssertions(as...)
+	return err
+}
+
+// propagateAssertions propagates assertions from this flow's dependencies (if any)
+// to its output.  This must be called after the flow is computed but before
+// it is marked as Done.
+// propagateAssertions is valid only for Intern and Exec ops.
+func (e *Eval) propagateAssertions(f *Flow) error {
+	if !f.Op.External() || f.Op == Extern {
+		return nil
+	}
+	fs, ok := f.Value.(reflow.Fileset)
+	if !ok {
+		return nil
+	}
+	return fs.AddAssertions(f.depAssertions()...)
+}
+
 // exec performs and waits for an exec with the given config.
 // exec tries each step up to numExecTries. Exec returns a value
 // pointer which has been registered as live.
@@ -1561,38 +1887,78 @@ func (e *Eval) exec(ctx context.Context, f *Flow) error {
 		stateWait
 		stateInspect
 		stateResult
+		stateVerify
 		statePromote
 		stateDone
 	)
 	var (
-		err error
-		x   reflow.Exec
-		r   reflow.Result
-		n   = 0
-		s   = statePut
-		id  = f.Digest()
-		cfg = f.ExecConfig()
+		err     error
+		x       reflow.Exec
+		r       reflow.Result
+		n       = 0
+		s       = statePut
+		id      = f.Digest()
+		cfg     = f.ExecConfig()
+		tcancel context.CancelFunc
+		tctx    context.Context
 	)
+
 	// TODO(marius): we should distinguish between fatal and nonfatal errors.
 	// The fatal ones are useless to retry.
+
+	defer func() {
+		if tcancel == nil {
+			return
+		}
+		terr := err
+		if err == nil {
+			terr = r.Err
+		}
+		if tdbErr := e.TaskDB.SetTaskComplete(context.Background(), f.TaskID, terr, time.Now()); tdbErr != nil {
+			e.Log.Debugf("taskdb settaskcomplete: %v\n", tdbErr)
+		}
+		tcancel()
+	}()
 	for n < numExecTries && s < stateDone {
 		switch s {
 		case statePut:
-			x, err = e.Executor.Put(ctx, id, cfg)
+			if e.TaskDB != nil {
+				// disable govet check due to https://github.com/golang/go/issues/29587
+				tctx, tcancel = context.WithCancel(ctx) //nolint: govet
+				err = e.TaskDB.CreateTask(tctx, f.TaskID, e.RunID, id, taskdb.NewImgCmdID(cfg.Image, cfg.Cmd), cfg.Ident, "")
+				if err != nil {
+					e.Log.Debugf("taskdb createtask: %v\n", err)
+				}
+				go func() { _ = taskdb.KeepTaskAlive(tctx, e.TaskDB, f.TaskID) }()
+			}
+			x, err = e.Executor.Put(ctx, f.ExecId, cfg)
 			if err == nil {
 				f.Exec = x
 				e.LogFlow(ctx, f)
 			}
 		case stateWait:
 			err = x.Wait(ctx)
+			if e.TaskDB != nil {
+				if tdbErr := e.TaskDB.SetTaskResult(tctx, f.TaskID, x.ID()); tdbErr != nil {
+					e.Log.Debugf("taskdb settaskresult: %v\n", tdbErr)
+				}
+				tcancel()
+			}
 		case stateInspect:
 			f.Inspect, err = x.Inspect(ctx)
 		case stateResult:
 			r, err = x.Result(ctx)
-			if err == nil {
-				e.Mutate(f, r.Fileset, Incr)
-			}
+		case stateVerify:
+			err = traverse.Each(f.NExecArg(), func(i int) error {
+				earg := f.ExecArg(i)
+				if earg.Out {
+					return nil
+				}
+				fs := f.Deps[earg.Index].Value.(reflow.Fileset)
+				return e.Executor.VerifyIntegrity(ctx, fs)
+			})
 		case statePromote:
+			e.Mutate(f, r.Fileset, Incr, Propagate)
 			err = x.Promote(ctx)
 		}
 		if err != nil {
@@ -1600,6 +1966,9 @@ func (e *Eval) exec(ctx context.Context, f *Flow) error {
 		} else {
 			n = 0
 			s++
+			if s == stateVerify && !e.PostUseChecksum {
+				s++
+			}
 		}
 	}
 	if err != nil {
@@ -1669,6 +2038,11 @@ const (
 	Refresh
 	// MustIntern sets the flow's MustIntern flag to true.
 	MustIntern
+	// NoStatus indicates that a flow node's status should not be updated.
+	NoStatus
+	// Propagate is the mutation that propagates a flow's dependency assertions
+	// to the flow's result Fileset.  Results in a no-op if the flow has no result fileset.
+	Propagate
 )
 
 // Mutate safely applies a set of mutations vis-a-vis the garbage
@@ -1686,6 +2060,7 @@ func (e *Eval) Mutate(f *Flow, muts ...interface{}) {
 	var (
 		prevState, thisState State
 		refresh              bool
+		statusOk             = true
 	)
 	for _, mut := range muts {
 		switch arg := mut.(type) {
@@ -1715,6 +2090,12 @@ func (e *Eval) Mutate(f *Flow, muts ...interface{}) {
 				refresh = true
 			case MustIntern:
 				f.MustIntern = true
+			case NoStatus:
+				statusOk = false
+			case Propagate:
+				if err := e.propagateAssertions(f); err != nil {
+					panic(fmt.Errorf("unexpected propagation error: %v", err))
+				}
 			}
 		case Reserve:
 			f.Reserved.Add(f.Reserved, reflow.Resources(arg))
@@ -1725,6 +2106,29 @@ func (e *Eval) Mutate(f *Flow, muts ...interface{}) {
 		}
 	}
 	e.muGC.RUnlock()
+	// Assign an ExecId for Execing (external) flows. In the scheduler case, f.ExecId is a random digest and is only set
+	// if the digest is its zero value.
+	if f.Op.External() && f.State == Execing {
+		switch {
+		case e.Scheduler == nil:
+			if err := e.assignExecId(context.Background(), f); err != nil {
+				f.Err = errors.Recover(errors.E("assign execid", f.Digest(), errors.Temporary, err))
+			}
+		// TODO(dnicolaou): Remove ExecId from scheduler mode once eval_test.go scheduler tests no longer
+		// require ExecId to keep track of execs and their respective tasks. f.ExecId.IsZero() check exists
+		// to ensure that eval_test.go scheduler tests will pass because in these tests, each flow is provided
+		// an ExecId that must remain unchanged.
+		case e.Scheduler != nil && f.ExecId.IsZero():
+			f.ExecId = reflow.Digester.Rand(nil)
+		}
+	}
+	// When a flow is done (without errors), add all its assertions to the vector clock.
+	if f.Op.External() && f.State == Done && f.Err == nil {
+		err := e.assertions.AddFrom(f.Value.(reflow.Fileset).Assertions()...)
+		if err != nil {
+			f.Err = errors.Recover(errors.E("adding assertions", f.Digest(), errors.Temporary, err))
+		}
+	}
 	// Update task status, if applicable.
 	if e.Status == nil {
 		return
@@ -1734,7 +2138,7 @@ func (e *Eval) Mutate(f *Flow, muts ...interface{}) {
 	default:
 		return
 	}
-	if prevState < Transfer && thisState >= Transfer && f.Status == nil {
+	if (thisState == Transfer || thisState == Running || thisState == Execing) && f.Status == nil && statusOk {
 		// TODO(marius): digest? fmt("%-*s %s", n, ident, f.Digest().Short())
 		f.Status = e.Status.Start(f.Ident)
 	}
@@ -1754,14 +2158,18 @@ func (e *Eval) Mutate(f *Flow, muts ...interface{}) {
 				status = fmt.Sprintf("done %s", data.Size(f.Value.(reflow.Fileset).Size()))
 			}
 		}
-	case Running:
+	case Running, Execing:
 		switch f.Op {
 		case Extern:
-			status = fmt.Sprintf("%s %s", f.URL, data.Size(f.Deps[0].Value.(reflow.Fileset).Size()))
+			var sz string
+			if fs, ok := f.Deps[0].Value.(reflow.Fileset); ok {
+				sz = fmt.Sprintf(" %s", data.Size(fs.Size()))
+			}
+			status = fmt.Sprintf("%s%s", f.URL, sz)
 		case Intern:
 			status = fmt.Sprintf("%s", f.URL)
 		case Exec:
-			status = fmt.Sprintf("%s", abbrevCmd(f))
+			status = f.AbbrevCmd()
 		}
 	case Transfer:
 		if f.TransferSize > 0 {
@@ -1796,7 +2204,7 @@ var statusPrinters = [maxOp]struct {
 	debug func(io.Writer, *Flow)
 }{
 	Exec: {
-		run: func(w io.Writer, f *Flow) { io.WriteString(w, abbrevCmd(f)) },
+		run: func(w io.Writer, f *Flow) { io.WriteString(w, f.AbbrevCmd()) },
 		debug: func(w io.Writer, f *Flow) {
 			argv := make([]interface{}, len(f.Argstrs))
 			for i := range f.Argstrs {
@@ -1966,6 +2374,8 @@ func (e *Eval) LogFlow(ctx context.Context, f *Flow) {
 	switch f.State {
 	case Running:
 		state = "run"
+	case Execing:
+		state = "exec"
 	case Done:
 		if f.Err != nil {
 			state = "err"
@@ -1978,7 +2388,7 @@ func (e *Eval) LogFlow(ctx context.Context, f *Flow) {
 	fmt.Fprintf(&b, "%-12s %s %-4s %6s ", f.Ident, f.Digest().Short(), state, f.Op.String())
 	pr := statusPrinters[f.Op]
 	switch f.State {
-	case Running:
+	case Running, Execing:
 		if pr.run != nil {
 			pr.run(&b, f)
 		}
@@ -2009,7 +2419,17 @@ func (e *Eval) LogFlow(ctx context.Context, f *Flow) {
 	b.Reset()
 	fmt.Fprintf(&b, "%s %v %s:\n", f.Ident, f.Digest().Short(), f.Position)
 	if f.Op == Exec {
-		fmt.Fprintf(&b, "\tresources: %s\n", f.Resources)
+		logResources := make(reflow.Resources)
+		switch {
+		case f.State == Done:
+			// Get resources from ExecInspect if the flow is done
+			// because `f.Reserved` may have already been cleared
+			// by `returnFlow()`.
+			logResources.Set(f.Inspect.Config.Resources)
+		default:
+			logResources.Set(f.Reserved)
+		}
+		fmt.Fprintf(&b, "\tresources: %s\n", logResources)
 	}
 	for _, key := range f.CacheKeys() {
 		fmt.Fprintf(&b, "\t%s\n", key)
@@ -2025,6 +2445,89 @@ func (e *Eval) LogFlow(ctx context.Context, f *Flow) {
 	} else {
 		e.Log.Debug(b.String())
 	}
+}
+
+// taskWait waits for a task to finish running and updates the flow, cache, and taskdb accordingly.
+func (e *Eval) taskWait(ctx context.Context, f *Flow, task *sched.Task) error {
+	if err := task.Wait(ctx, sched.TaskRunning); err != nil {
+		return err
+	}
+	// Grab the task's exec so that it can be logged properly.
+	f.Exec = task.Exec
+	e.LogFlow(ctx, f)
+	if err := task.Wait(ctx, sched.TaskDone); err != nil {
+		return err
+	}
+	f.Inspect = task.Inspect
+	if task.Err != nil {
+		e.Mutate(f, task.Err, Done)
+	} else {
+		e.Mutate(f, task.Result.Err, task.Result.Fileset, Propagate, Done)
+	}
+	if e.TaskDB != nil {
+		e.taskdbWriteAsync(ctx, f.Op, task.Inspect, task.Exec, task.ID)
+	}
+	return nil
+}
+
+func (e *Eval) newTask(f *Flow) *sched.Task {
+	t := sched.NewTask()
+	t.ID = taskdb.TaskID(f.ExecId)
+	t.RunID = e.RunID
+	t.FlowID = f.Digest()
+	t.Config = f.ExecConfig()
+	t.Log = e.Log.Tee(nil, fmt.Sprintf("scheduler task %s (flow %s): ", t.ID.IDShort(), t.FlowID.Short()))
+	return t
+}
+
+// reviseResources revises the resources of the submitted tasks and flows, if applicable.
+func (e *Eval) reviseResources(ctx context.Context, tasks []*sched.Task, flows []*Flow) {
+	if e.Predictor == nil {
+		return
+	}
+	predictions := e.Predictor.Predict(ctx, tasks...)
+	for i, task := range tasks {
+		if predicted, ok := predictions[task]; ok {
+			oldResources := task.Config.Resources.String()
+			f := flows[i]
+			newReserved := make(reflow.Resources)
+			newReserved.Set(f.Reserved)
+			for k, v := range predicted.Resources {
+				newReserved[k] = v
+			}
+			newReserved["mem"] = math.Max(newReserved["mem"], minExecMemory)
+			e.Mutate(f, Unreserve(f.Reserved), Reserve(newReserved))
+			task.Config = f.ExecConfig()
+			e.Log.Debugf("task %s (flow %s): modifying resources from %s to %s", task.ID.IDShort(), task.FlowID.Short(), oldResources, task.Config.Resources)
+			task.ExpectedDuration = predicted.Duration
+			e.Log.Debugf("task %s (flow %s): predicted duration %s", task.ID.IDShort(), task.FlowID.Short(), predicted.Duration.Round(time.Second))
+		}
+	}
+}
+
+// retryTask retries a task with the specified resources and waits for it to complete.
+func (e *Eval) retryTask(ctx context.Context, f *Flow, resources reflow.Resources, retryType, msg string) (*sched.Task, error) {
+	// Apply ExecReset so that the exec can be resubmitted to the scheduler with the flow's
+	// exec runtime parameters reset.
+	f.ExecReset()
+	e.Mutate(f, Unreserve(f.Reserved), Reserve(resources), Execing)
+	task := e.newTask(f)
+	e.Log.Printf("flow %s: %s: re-submitting task %s with %s", f.Digest().Short(), retryType, task.ID.IDShort(), msg)
+	e.Scheduler.Submit(task)
+	return task, e.taskWait(ctx, f, task)
+}
+
+// oomAdjust returns a new set of resources with increased memory.
+// TODO(dnicolaou): Adjust based on actual used memory instead of allocated.
+func oomAdjust(specified, used reflow.Resources) reflow.Resources {
+	newResources := make(reflow.Resources)
+	newResources.Set(used)
+	if specified["mem"] > used["mem"] {
+		newResources["mem"] = specified["mem"]
+	} else {
+		newResources["mem"] *= memMultiplier
+	}
+	return newResources
 }
 
 func accumulate(flows []*Flow) (int, string) {
@@ -2203,13 +2706,11 @@ func unmarshal(ctx context.Context, repo reflow.Repository, k digest.Digest, v i
 // call fails.
 func missing(ctx context.Context, r reflow.Repository, files ...reflow.File) ([]reflow.File, error) {
 	exists := make([]bool, len(files))
-	g, gctx := errgroup.WithContext(ctx)
+	g, ctx := errgroup.WithContext(ctx)
 	for i, file := range files {
 		i, file := i, file
 		g.Go(func() error {
-			ctx, cancel := context.WithTimeout(gctx, 10*time.Second)
 			_, err := r.Stat(ctx, file.ID)
-			cancel()
 			if err == nil {
 				exists[i] = true
 			} else if errors.Is(errors.NotExist, err) {
@@ -2219,9 +2720,6 @@ func missing(ctx context.Context, r reflow.Repository, files ...reflow.File) ([]
 		})
 	}
 	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	all := files
@@ -2269,21 +2767,7 @@ func equal(c, d counters) bool {
 
 var humanState = map[State]string{
 	Running:  "running",
+	Execing:  "executing",
 	Transfer: "transferring",
 	Ready:    "waiting",
-}
-
-func abbrevCmd(f *Flow) string {
-	argv := make([]interface{}, len(f.Argstrs))
-	for i := range f.Argstrs {
-		argv[i] = f.Argstrs[i]
-	}
-	cmd := fmt.Sprintf(f.Cmd, argv...)
-	// Special case: if we start with a command with an absolute path,
-	// abbreviate to basename.
-	cmd = strings.TrimSpace(cmd)
-	cmd = trimpath(cmd)
-	cmd = trimspace(cmd)
-	cmd = abbrev(cmd, nabbrev)
-	return fmt.Sprintf("%s %s", leftabbrev(f.Image, nabbrevImage), cmd)
 }

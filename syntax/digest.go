@@ -15,14 +15,10 @@ import (
 )
 
 var (
-	exprDigest [maxExpr]digest.Digest
-	nDigest    [32]digest.Digest
+	nDigest [32]digest.Digest
 )
 
 func init() {
-	for i := range exprDigest {
-		reflow.Digester.FromBytes([]byte{byte(i)})
-	}
 	for i := range nDigest {
 		nDigest[i] = reflow.Digester.FromBytes([]byte{byte(i)})
 	}
@@ -45,7 +41,7 @@ func digestN(i int) digest.Digest {
 // we go through some lengths to normalize, for example by using De
 // Bruijn indices (levels) to remove dependence on concrete names. In
 // the future, we could consider canonicalizing the expression tree
-// as well (e.g., by exploiting commutatvity, etc.)
+// as well (e.g., by exploiting commutativity, etc.)
 func (e *Expr) Digest(env *values.Env) digest.Digest {
 	w := reflow.Digester.NewWriter()
 	e.digest(w, env)
@@ -84,7 +80,7 @@ func (e *Expr) digest(w io.Writer, env *values.Env) {
 			f.Expr.digest(w, env)
 		}
 		e.Left.digest(w, env)
-	case ExprConst:
+	case ExprLit:
 		digest.WriteDigest(w, values.Digest(e.Val, e.Type))
 	case ExprBlock:
 		for _, decl := range e.Decls {
@@ -134,6 +130,11 @@ func (e *Expr) digest(w io.Writer, env *values.Env) {
 			ke.digest(w, env)
 			e.Map[ke].digest(w, env)
 		}
+	case ExprVariant:
+		io.WriteString(w, e.Ident)
+		if e.Left != nil {
+			digest.WriteDigest(w, e.Left.Digest(env))
+		}
 	case ExprExec:
 		for _, d := range e.Decls {
 			if d.Pat.Ident == "image" {
@@ -161,6 +162,16 @@ func (e *Expr) digest(w io.Writer, env *values.Env) {
 		e.Cond.digest(w, env)
 		e.Left.digest(w, env)
 		e.Right.digest(w, env)
+	case ExprSwitch:
+		leftDigest := e.Left.Digest(env)
+		digest.WriteDigest(w, leftDigest)
+		for _, c := range e.CaseClauses {
+			env2 := env.Push()
+			for _, id := range c.Pat.Idents(nil) {
+				env2.Bind(id, leftDigest)
+			}
+			c.Expr.digest(w, env2)
+		}
 	case ExprDeref:
 		e.Left.digest(w, env)
 		io.WriteString(w, e.Ident)
@@ -198,11 +209,20 @@ func (e *Expr) digest(w io.Writer, env *values.Env) {
 		switch e.Op {
 		default:
 			panic("bad builtin " + e.Op)
-		case "len", "unzip", "panic", "map", "list", "flatten", "delay", "trace", "range":
-			e.Left.digest(w, env)
-		case "zip":
-			e.Right.digest(w, env)
-			e.Left.digest(w, env)
+		case "len", "unzip", "panic", "map", "list", "flatten", "delay", "trace":
+			e.Fields[0].Expr.digest(w, env)
+		case "zip", "range":
+			// To retain digest backwards compatibility with a previous AST representation for builtins,
+			// we digest the second argument before the first.
+			e.Fields[1].Expr.digest(w, env)
+			e.Fields[0].Expr.digest(w, env)
+		case "reduce":
+			e.Fields[0].Expr.digest(w, env)
+			e.Fields[1].Expr.digest(w, env)
+		case "fold":
+			e.Fields[0].digest(w, env)
+			e.Fields[1].digest(w, env)
+			e.Fields[2].digest(w, env)
 		}
 	case ExprRequires:
 		e.Left.digest(w, e.Env)
@@ -230,15 +250,17 @@ func (e *Expr) digest1(w io.Writer) {
 	case ExprBinop, ExprUnop:
 		io.WriteString(w, e.Op)
 	case ExprApply:
-	case ExprConst:
+	case ExprLit:
 		digest.WriteDigest(w, values.Digest(e.Val, e.Type))
 	case ExprBlock:
 	case ExprFunc:
 		panic("ExprFunc invalid for digest1")
 	case ExprTuple, ExprStruct, ExprList, ExprMap:
 	case ExprExec:
-		panic("ExprExec invalid for digest1")
+		io.WriteString(w, e.image)
+		io.WriteString(w, e.Template.String())
 	case ExprCond:
+	case ExprSwitch:
 	case ExprDeref:
 		io.WriteString(w, e.Ident)
 	case ExprIndex, ExprCompr:

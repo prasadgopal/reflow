@@ -13,6 +13,8 @@ import (
 	"strings"
 
 	"github.com/grailbio/base/limiter"
+	"github.com/grailbio/reflow"
+	"github.com/grailbio/reflow/assoc"
 	"github.com/grailbio/reflow/flow"
 	"golang.org/x/sync/errgroup"
 )
@@ -43,14 +45,10 @@ supplied via a CSV batch file as in "reflow runbatch".`
 	default:
 		flags.Usage()
 	}
-	assoc, err := c.Config.Assoc()
-	if err != nil {
-		c.Fatal(err)
-	}
-	repo, err := c.Config.Repository()
-	if err != nil {
-		c.Fatal(err)
-	}
+	var assoc assoc.Assoc
+	c.must(c.Config.Instance(&assoc))
+	var repo reflow.Repository
+	c.must(c.Config.Instance(&repo))
 	config := flow.EvalConfig{
 		Log:        c.Log,
 		Repository: repo,
@@ -62,16 +60,12 @@ supplied via a CSV batch file as in "reflow runbatch".`
 	repair.Go(ctx, *writebackConcurrency)
 	if *batch != "" {
 		f, err := os.Open(*batch)
-		if err != nil {
-			c.Fatal(err)
-		}
+		c.must(err)
 		r := csv.NewReader(f)
 		r.FieldsPerRecord = -1
 		records, err := r.ReadAll()
 		f.Close()
-		if err != nil {
-			c.Fatal(err)
-		}
+		c.must(err)
 		lim := limiter.New()
 		lim.Release(50)
 		header, records := records[0], records[1:]
@@ -89,31 +83,33 @@ supplied via a CSV batch file as in "reflow runbatch".`
 				for i, key := range header {
 					args = append(args, fmt.Sprintf("-%s=%s", key, record[i]))
 				}
-				er, err := c.Eval(args)
-				if err != nil {
+				e := Eval{
+					InputArgs: args,
+				}
+				if err := e.Run(); err != nil {
+					return err
+				}
+				if err := e.ResolveImages(c.Config); err != nil {
 					return err
 				}
 				c.Log.Printf("repair: %s", strings.Join(args, " "))
 				// TODO(sbagaria): thread-safe append the resolved canonical images to repair.ImageMap.
-				// Or instead of storing imageMap, store tool.imageResolver instead in EvalConfig.
-				repair.Do(ctx, er.Flow)
+				// Or instead of storing imageMap, store tool.ImageResolver instead in EvalConfig.
+				repair.Do(ctx, e.Main())
 				return nil
 			})
 		}
-		if err := g.Wait(); err != nil {
-			c.Fatal(err)
-		}
+		c.must(g.Wait())
 	} else {
-		er, err := c.Eval(flags.Args())
-		repair.ImageMap = er.ImageMap
-		if err != nil {
-			c.Fatal(err)
+		e := Eval{
+			InputArgs: flags.Args(),
 		}
-		repair.Do(ctx, er.Flow)
+		c.must(e.Run())
+		c.must(e.ResolveImages(c.Config))
+		repair.ImageMap = e.ImageMap
+		repair.Do(ctx, e.Main())
 
 	}
-	if err := repair.Done(); err != nil {
-		c.Fatal(err)
-	}
+	c.must(repair.Done())
 	c.Log.Printf("wrote %d new assoc entries", repair.NumWrites)
 }

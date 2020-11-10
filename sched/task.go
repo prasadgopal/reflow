@@ -7,11 +7,13 @@ package sched
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/grailbio/base/digest"
 	"github.com/grailbio/base/sync/ctxsync"
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/log"
+	"github.com/grailbio/reflow/taskdb"
 )
 
 // TaskState enumerates the possible states of a task.
@@ -54,7 +56,7 @@ func (s TaskState) String() string {
 // submission, all coordination is performed through the task struct.
 type Task struct {
 	// ID is a caller-assigned identifier for the task.
-	ID digest.Digest
+	ID taskdb.TaskID
 	// Config is the task's exec config, which is passed on to the
 	// alloc after scheduling.
 	Config reflow.ExecConfig
@@ -76,12 +78,29 @@ type Task struct {
 	// set by the scheduler before the task enters TaskRunning state.
 	Exec reflow.Exec
 
+	// Priority is the task priority. Lower numbers indicate higher priority.
+	// Higher priority tasks will get scheduler before any lower priority tasks.
+	Priority int
+
+	// ExpectedDuration is the duration the task is expected to take used only as a hint
+	// by the scheduler for better scheduling.
+	ExpectedDuration time.Duration
+
+	// RunID that created this task.
+	RunID taskdb.RunID
+	// FlowID is the digest (flow.Digest) of the flow for which this task was created.
+	FlowID digest.Digest
+
 	mu   sync.Mutex
 	cond *ctxsync.Cond
 
 	state TaskState
 	alloc *alloc
 	index int
+	stats *TaskStats
+
+	// nonDirectTransfer represents a task which cannot be executed as a direct transfer.
+	nonDirectTransfer bool
 }
 
 // NewTask returns a new, initialized task. The Task may be populated
@@ -114,8 +133,42 @@ func (t *Task) Wait(ctx context.Context, state TaskState) error {
 func (t *Task) set(state TaskState) {
 	t.mu.Lock()
 	t.state = state
+	t.stats.Update(t)
 	t.cond.Broadcast()
 	t.mu.Unlock()
+}
+
+// TaskSet is a set of tasks.
+type TaskSet map[*Task]bool
+
+// newTaskSet returns a set of tasks.
+func NewTaskSet(tasks ...*Task) TaskSet {
+	set := make(TaskSet)
+	for _, task := range tasks {
+		set[task] = true
+	}
+	return set
+}
+
+// RemoveAll removes tasks from the taskSet.
+func (s TaskSet) RemoveAll(tasks ...*Task) {
+	for _, task := range tasks {
+		delete(s, task)
+	}
+}
+
+// Slice returns a slice containing the tasks in the taskSet.
+func (s TaskSet) Slice() []*Task {
+	var tasks = make([]*Task, 0, len(s))
+	for task := range s {
+		tasks = append(tasks, task)
+	}
+	return tasks
+}
+
+// Len returns the number of tasks in the taskSet.
+func (s TaskSet) Len() int {
+	return len(s)
 }
 
 // Taskq defines a priority queue of tasks, ordered by
@@ -125,6 +178,9 @@ type taskq []*Task
 func (q taskq) Len() int { return len(q) }
 
 func (q taskq) Less(i, j int) bool {
+	if q[i].Priority != q[j].Priority {
+		return q[i].Priority < q[j].Priority
+	}
 	return q[i].Config.Resources.ScaledDistance(nil) < q[j].Config.Resources.ScaledDistance(nil)
 }
 

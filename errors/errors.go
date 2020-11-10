@@ -23,14 +23,14 @@ import (
 	goerrors "errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 
 	"github.com/grailbio/base/digest"
-	"github.com/grailbio/reflow/log"
 )
 
 // Separator is inserted between chained errors while rendering.
-// The default value (":\n\t") is inteded for interactive tools. A
+// The default value (":\n\t") is intended for interactive tools. A
 // server can set this to a different value to be more log friendly.
 var Separator = ":\n\t"
 
@@ -71,6 +71,8 @@ const (
 	Net
 	// Precondition indicates that a precondition was not met.
 	Precondition
+	// OOM indicates a out-of-memory error.
+	OOM
 
 	maxKind
 )
@@ -110,6 +112,8 @@ func (k Kind) String() string {
 		return "network error"
 	case Precondition:
 		return "precondition was not met"
+	case OOM:
+		return "OOM error"
 	}
 }
 
@@ -130,6 +134,7 @@ var kind2string = [maxKind]string{
 	Invalid:            "Invalid",
 	Net:                "Net",
 	Precondition:       "Precondition",
+	OOM:                "OOM",
 }
 
 var string2kind = map[string]Kind{
@@ -149,6 +154,7 @@ var string2kind = map[string]Kind{
 	"Invalid":            Invalid,
 	"Net":                Net,
 	"Precondition":       Precondition,
+	"OOM":                OOM,
 }
 
 // Error defines a Reflow error. It is used to indicate an error
@@ -226,8 +232,7 @@ func E(args ...interface{}) error {
 		// and, URI for other things?
 		default:
 			_, file, line, _ := runtime.Caller(1)
-			log.Printf("errors.E: bad call (type %T) from %s:%d: %v", arg, file, line, args)
-			return Errorf("unknown type %T, value %v in error call", arg, arg)
+			e.Arg = append(e.Arg, fmt.Sprintf("illegal (%T %v from %s:%d)", arg, arg, filepath.Base(file), line))
 		}
 	}
 	if e.Err == nil {
@@ -323,8 +328,8 @@ var Errorf = fmt.Errorf
 // New is an alternate spelling of errors.New.
 var New = goerrors.New
 
-// Recover recovers any error into an *Error. If the passed-in Error
-// is already an error, it is simply returned; otherwise it is wrapped.
+// Recover recovers any error into an *Error. If the passed-in err is
+// already an *Error or nil, it is simply returned; otherwise it is wrapped.
 func Recover(err error) *Error {
 	if err == nil {
 		return nil
@@ -482,7 +487,7 @@ func is(kind Kind, e *Error) bool {
 }
 
 // Transient tells whether error err is likely transient, and thus may
-// be usefully retried.
+// be usefully retried. The passed in error must not be nil.
 func Transient(err error) bool {
 	switch Recover(err).Kind {
 	case Timeout, Temporary, TooManyTries, Unavailable:
@@ -494,6 +499,56 @@ func Transient(err error) bool {
 
 // Restartable determines if the provided error is restartable.
 // Restartable errors include transient errors and network errors.
+// The passed in error must not be nil.
 func Restartable(err error) bool {
 	return Transient(err) || Is(Net, err)
+}
+
+// NonRetryable tells whether error err is likely fatal, and thus not
+// useful to retry. The passed in error must not be nil.
+// Note that NonRetryable != !Restartable; these functions are not the
+// inverse of each other. They each report on the errors they know to
+// be either non-retryable or restartable, but there exist errors which
+// don't belong to either category.
+func NonRetryable(err error) bool {
+	switch Recover(err).Kind {
+	case NotSupported, Invalid, NotExist, Fatal:
+		return true
+	default:
+		return false
+	}
+}
+
+// retryableErrorKey is used to store and access retryable error kinds in a context.
+// Intentionally not exported, use WithRetryableKinds and GetRetryableKinds instead.
+type retryableErrorKey struct{}
+
+// WithRetryableKinds returns a child context of ctx with the given error kinds and
+// any pre-existing ones. WithRetryableKinds should be used rather than directly
+// setting the value to avoid overwriting any previously set retryable errors.
+func WithRetryableKinds(ctx context.Context, ks ...Kind) context.Context {
+	set, ok := ctx.Value(retryableErrorKey{}).(map[Kind]bool)
+	if !ok {
+		set = make(map[Kind]bool)
+	}
+	for _, k := range ks {
+		set[k] = true
+	}
+	return context.WithValue(ctx, retryableErrorKey{}, set)
+}
+
+// GetRetryableKinds returns a slice of any retryable error kinds stored in ctx.
+func GetRetryableKinds(ctx context.Context) []Kind {
+	kinds, ok := ctx.Value(retryableErrorKey{}).(map[Kind]bool)
+	if !ok {
+		return []Kind{}
+	}
+	return getKeys(kinds)
+}
+
+func getKeys(m map[Kind]bool) (out []Kind) {
+	for k, _ := range m {
+		out = append(out, k)
+	}
+	return out
 }

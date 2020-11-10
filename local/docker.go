@@ -19,12 +19,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
+	"docker.io/go-docker"
+	"docker.io/go-docker/api/types"
+	"docker.io/go-docker/api/types/container"
+	"docker.io/go-docker/api/types/network"
 	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/grailbio/base/data"
 	"github.com/grailbio/base/digest"
+	"github.com/grailbio/base/retry"
+	"github.com/grailbio/base/sync/once"
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/errors"
 	"github.com/grailbio/reflow/log"
@@ -39,6 +42,10 @@ const (
 	inspectPath  = "inspect.json"
 	manifestPath = "manifest.json"
 	objectPath   = "obj"
+	// hardLimitSwapMem is the amount of memory swap allowed
+	// on top of a docker container's hard memory
+	// limit.
+	hardLimitSwapMem = 100 * data.MiB
 )
 
 var dockerUser = fmt.Sprintf("%d:%d", os.Getuid(), os.Getgid())
@@ -56,7 +63,7 @@ type dockerExec struct {
 	Log *log.Logger
 
 	id      digest.Digest
-	client  *client.Client
+	client  *docker.Client
 	repo    *filerepo.Repository
 	staging filerepo.Repository
 	stdout  *log.Logger
@@ -67,8 +74,11 @@ type dockerExec struct {
 
 	// Manifest stores the serializable state of the exec.
 	Manifest
-	err error
+	err         error
+	promoteOnce once.Task
 }
+
+var retryPolicy = retry.MaxTries(retry.Backoff(time.Second, 10*time.Second, 1.5), 5)
 
 // newExec creates a new exec with parent executor x.
 func newDockerExec(id digest.Digest, x *Executor, cfg reflow.ExecConfig, stdout, stderr *log.Logger) *dockerExec {
@@ -137,12 +147,12 @@ func (e *dockerExec) containerName() string {
 func (e *dockerExec) create(ctx context.Context) (execState, error) {
 	if _, err := e.client.ContainerInspect(ctx, e.containerName()); err == nil {
 		return execCreated, nil
-	} else if !client.IsErrContainerNotFound(err) {
+	} else if !docker.IsErrNotFound(err) {
 		return execInit, errors.E("ContainerInspect", e.containerName(), kind(err), err)
 	}
-	// TODO: it might be worthwhile doing image pulling as a separate state.
 	if err := e.Executor.ensureImage(ctx, e.Config.Image); err != nil {
-		return execInit, fmt.Errorf("failed to pull image %s: %s", e.Config.Image, err)
+		e.Log.Errorf("error ensuring image %s: %v", e.Config.Image, err)
+		return execInit, errors.E("ensureimage", e.Config.Image, err)
 	}
 	// Map the products to input arguments and volume bindings for
 	// the container. Currently we map the whole repository (named by
@@ -180,12 +190,25 @@ func (e *dockerExec) create(ctx context.Context) (execState, error) {
 			e.hostPath("return") + ":/return",
 		},
 		NetworkMode: container.NetworkMode("host"),
+		// Try to ensure that jobs we control get killed before the reflowlet,
+		// so that we don't lose adjacent tasks unnecessarily and so that
+		// errors are more sensible to the user.
+		OomScoreAdj: 1000,
 	}
-	/*		TODO: introduce strict mode for this
-	if mem := e.Config.Resources.Memory; mem > 0 {
+	if e.Config.NeedDockerAccess {
+		hostConfig.Binds = append(hostConfig.Binds, "/var/run/docker.sock:/var/run/docker.sock")
+	}
+
+	// Restrict docker memory usage if specified by the user.
+	// If the docker container memory limit (the cgroup limit) is exceeded
+	// before the OOM Killer kills the process, the following message
+	// is recorded in /dev/kmsg:
+	// Memory cgroup out of memory: Kill process <pid>
+	if mem := e.Config.Resources["mem"]; mem > 0 && e.Executor.HardMemLimit {
 		hostConfig.Resources.Memory = int64(mem)
+		hostConfig.Resources.MemorySwap = int64(mem) + int64(hardLimitSwapMem)
 	}
-	*/
+
 	env := []string{
 		"tmp=/tmp",
 		"TMPDIR=/tmp",
@@ -207,7 +230,7 @@ func (e *dockerExec) create(ctx context.Context) (execState, error) {
 			// We mark this as temporary, because most of the time it is.
 			// TODO(marius): can we get better error classification from
 			// the AWS SDK?
-			return execInit, errors.E("run", e.ID, errors.Temporary, err)
+			return execInit, errors.E("run", e.id, errors.Temporary, err)
 		}
 		// TODO(marius): region?
 		env = append(env, "AWS_ACCESS_KEY_ID="+creds.AccessKeyID)
@@ -257,6 +280,7 @@ func (e *dockerExec) start(ctx context.Context) (execState, error) {
 	}
 	var err error
 	e.Docker, err = e.client.ContainerInspect(ctx, e.containerName())
+	e.Manifest.PID = e.Docker.State.Pid
 	if err != nil {
 		e.Log.Errorf("error inspecting container %q: %v", e.containerName(), err)
 	}
@@ -305,18 +329,20 @@ func (e *dockerExec) wait(ctx context.Context) (state execState, err error) {
 	profc := make(chan stats)
 	profctx, cancelprof := context.WithCancel(ctx)
 	go func() {
-		stats, err := e.profile(profctx)
-		if err != nil {
-			e.Log.Errorf("profile: %v", err)
-		}
-		profc <- stats
+		profc <- e.profile(profctx)
 	}()
 
-	code, err := e.client.ContainerWait(ctx, e.containerName())
-	if err != nil {
+	// The documentation for ContainerWait seems to imply that both channels will
+	// be sent. In practice it's one or the other, and it's also not buffered. Cool API.
+	respc, errc := e.client.ContainerWait(ctx, e.containerName(), container.WaitConditionNotRunning)
+	var code int64
+	select {
+	case err := <-errc:
+		cancelprof()
 		return execInit, errors.E("ContainerWait", e.containerName(), kind(err), err)
+	case resp := <-respc:
+		code = resp.StatusCode
 	}
-
 	// Best-effort writing of log files.
 	rc, err := e.client.ContainerLogs(
 		ctx, e.containerName(),
@@ -346,6 +372,11 @@ func (e *dockerExec) wait(ctx context.Context) (state execState, err error) {
 		}
 	}
 	e.Docker, err = e.client.ContainerInspect(ctx, e.containerName())
+
+	// Retrieve the profile before we clean up the results.
+	cancelprof()
+	e.Manifest.Stats = <-profc
+
 	if err != nil {
 		return execInit, errors.E("ContainerInspect", e.containerName(), kind(err), err)
 	}
@@ -355,10 +386,6 @@ func (e *dockerExec) wait(ctx context.Context) (state execState, err error) {
 	if code == 0 && e.Docker.State.ExitCode != 0 {
 		code = int64(e.Docker.State.ExitCode)
 	}
-
-	// Retrieve the profile before we clean up the results.
-	cancelprof()
-	e.Manifest.Stats = <-profc
 
 	finishedAt, err := time.Parse(time.RFC3339Nano, e.Docker.State.FinishedAt)
 	if err != nil {
@@ -390,12 +417,14 @@ func (e *dockerExec) wait(ctx context.Context) (state execState, err error) {
 			"exec", e.id, errors.Temporary,
 			errors.New("container returned in running state; docker daemon likely shutting down"))
 	// The remaining appear to be true completions.
-	case code == 137 || e.Docker.State.OOMKilled:
-		e.Manifest.Result.Err = errors.Recover(errors.E("exec", e.id, errors.Temporary, errors.New("killed by the OOM killer")))
 	case code == 0:
 		if err := e.install(ctx); err != nil {
 			return execInit, err
 		}
+	// Note: /dev/kmsg only exists on linux. If the container is running on a non-linux machine isOOMSystem will
+	// always return false.
+	case e.Docker.State.OOMKilled || e.isOOMSystem():
+		e.Manifest.Result.Err = errors.Recover(errors.E("exec", e.id, errors.OOM, errors.New("killed by the OOM killer")))
 	default:
 		e.Manifest.Result.Err = errors.Recover(errors.E("exec", e.id, errors.Errorf("exited with code %d", code)))
 	}
@@ -411,74 +440,114 @@ func (e *dockerExec) wait(ctx context.Context) (state execState, err error) {
 }
 
 // profile profiles the container and returns a profile when its
-// context is cancelled or when the container stops.
-func (e *dockerExec) profile(ctx context.Context) (stats, error) {
-	// Sample disk usage every minute.
-	// TODO(marius): perform a final disk usage check before returning
-	const diskPeriod = time.Minute
+// context is cancelled or when the container stops. profile profiles
+// the following resources:
+// cpu: CPU load defined as ncpu * deltaCPU / deltaSys.
+// mem: Memory usage in bytes.
+// tmp: Disk usage in the tmp directory in bytes.
+// disk: Total disk usage of the return directory in bytes.
+// Note that profile logs all its errors to e.Log.Error
+// and does not return an error. It simply attempts
+// to profile resources until ctx is cancelled.
+func (e *dockerExec) profile(ctx context.Context) stats {
 	var (
-		lastDiskTime time.Time
-		stats        = make(stats)
-		paths        = map[string]string{"tmp": e.path("tmp"), "disk": e.path("return")}
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		stats  = make(stats)
+		gauges = make(reflow.Gauges)
+		paths  = map[string]string{"tmp": e.path("tmp"), "disk": e.path("return")}
 	)
-	resp, err := e.client.ContainerStats(ctx, e.containerName(), true /*stream*/)
-	if err != nil {
-		return nil, errors.E("ContainerStats", kind(err), err)
-	}
-	defer resp.Body.Close()
-	dec := json.NewDecoder(resp.Body)
-	gauges := make(reflow.Gauges)
-	for {
-		var v types.StatsJSON
-		if err := dec.Decode(&v); err != nil {
-			if err == io.EOF {
-				return stats, nil
-			}
-			dec = json.NewDecoder(io.MultiReader(dec.Buffered(), resp.Body))
+
+	// Profile the disk usage every minute.
+	wg.Add(1)
+	go func() {
+		// The disk will be profiled whenever ticker.C or ctx.Done() receives a message.
+		// This means that disk will always be profiled at least once, regardless of when
+		// ctx is canceled.
+		defer wg.Done()
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for ctx.Err() == nil {
 			select {
-			case <-time.After(100 * time.Millisecond):
-				continue
+			case <-ticker.C:
 			case <-ctx.Done():
-				return stats, nil
 			}
-		}
-		var (
-			deltaCPU = float64(v.CPUStats.CPUUsage.TotalUsage - v.PreCPUStats.CPUUsage.TotalUsage)
-			deltaSys = float64(v.CPUStats.SystemUsage - v.PreCPUStats.SystemUsage)
-			// TODO(marius): switch to stats.CPUStats.OnlineCPUs once we update the
-			// Docker client.
-			ncpu = float64(len(v.CPUStats.CPUUsage.PercpuUsage))
-		)
-		if deltaSys > 0 {
-			// We compute the CPU time here by looking at the proportion of
-			// this container's CPU time to total system time. This is normalized
-			// and so needs to be multiplied by the  number of CPUs to get a
-			// portable load number.
-			load := ncpu * deltaCPU / deltaSys
-			stats.Observe("cpu", load)
-			gauges["cpu"] = load
-		}
-
-		// We exclude page cache memory since this is not counted towards
-		// your limits.
-		mem := float64(v.MemoryStats.Usage - v.MemoryStats.Stats["cache"])
-		stats.Observe("mem", mem)
-		gauges["mem"] = mem
-
-		if time.Since(lastDiskTime) >= diskPeriod {
-			for k, path := range paths {
-				n, err := du(path)
+			// Find disk usage in "tmp" and "return" directories.
+			for k, v := range paths {
+				n, err := du(v)
 				if err != nil {
-					e.Log.Errorf("du %s: %v", path, err)
+					e.Log.Errorf("du %s: %v", v, err)
 					continue
 				}
-				gauges[k] = float64(n)
+				mu.Lock()
 				stats.Observe(k, float64(n))
+				gauges[k] = float64(n)
+				mu.Unlock()
 			}
-			lastDiskTime = time.Now()
+
+			mu.Lock()
+			e.Manifest.Gauges = gauges.Snapshot()
+			mu.Unlock()
 		}
-		e.Manifest.Gauges = gauges.Snapshot()
-	}
+	}()
+
+	// Profile CPU and memory.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		resp, err := e.client.ContainerStats(ctx, e.containerName(), true /*stream*/)
+		if err != nil {
+			e.Log.Error(errors.E("ContainerStats", kind(err), err))
+			return
+		}
+		defer resp.Body.Close()
+		dec := json.NewDecoder(resp.Body)
+		for {
+			// CPU and memory stats are obtained from the go-docker API. This means that CPU/memory profiling
+			// is entirely dependent on receiving a valid docker stats JSON. If no valid JSON is received before
+			// ctx is canceled, no profiling data for CPU or memory will be contained in gauges or stats.
+			var v types.StatsJSON
+			if err := dec.Decode(&v); err != nil {
+				if err == io.EOF {
+					return
+				}
+				dec = json.NewDecoder(io.MultiReader(dec.Buffered(), resp.Body))
+				select {
+				case <-time.After(100 * time.Millisecond):
+					continue
+				case <-ctx.Done():
+					return
+				}
+			}
+			var (
+				deltaCPU = float64(v.CPUStats.CPUUsage.TotalUsage - v.PreCPUStats.CPUUsage.TotalUsage)
+				deltaSys = float64(v.CPUStats.SystemUsage - v.PreCPUStats.SystemUsage)
+				ncpu     = float64(v.CPUStats.OnlineCPUs)
+			)
+
+			mu.Lock()
+			if deltaSys > 0 {
+				// We compute the CPU time here by looking at the proportion of
+				// this container's CPU time to total system time. This is normalized
+				// and so needs to be multiplied by the number of CPUs to get a
+				// portable load number.
+				load := ncpu * deltaCPU / deltaSys
+				stats.Observe("cpu", load)
+				gauges["cpu"] = load
+			}
+			// We exclude page cache memory since this is not counted towards
+			// your limits.
+			mem := float64(v.MemoryStats.Usage - v.MemoryStats.Stats["cache"])
+
+			stats.Observe("mem", mem)
+			gauges["mem"] = mem
+			e.Manifest.Gauges = gauges.Snapshot()
+			mu.Unlock()
+		}
+	}()
+
+	wg.Wait()
+	return stats
 }
 
 // Go runs the exec's state machine. It resumes from the saved state
@@ -605,7 +674,7 @@ func (e *dockerExec) Shell(ctx context.Context) (io.ReadWriteCloser, error) {
 		if err != nil {
 			return nil, err
 		}
-		conn, err := e.client.ContainerExecAttach(ctx, response.ID, c)
+		conn, err := e.client.ContainerExecAttach(ctx, response.ID, types.ExecConfig{})
 		if err != nil {
 			return nil, err
 		}
@@ -628,6 +697,7 @@ func (e *dockerExec) Inspect(ctx context.Context) (reflow.ExecInspect, error) {
 	if err != nil {
 		inspect.Error = errors.Recover(err)
 	}
+	inspect.ExecError = e.Manifest.Result.Err
 	switch state {
 	case execUnstarted, execInit:
 		inspect.State = "initializing"
@@ -669,13 +739,24 @@ func (e *dockerExec) Result(ctx context.Context) (reflow.Result, error) {
 		return reflow.Result{}, err
 	}
 	if state != execComplete {
-		return reflow.Result{}, errors.Errorf("result %v: exec not complete", e.id)
+		return reflow.Result{}, errors.Errorf("result %v: %s", e.id, errExecNotComplete)
 	}
 	return e.Manifest.Result, nil
 }
 
+// Promote promotes the objects in the docker exec repository to the alloc repository.
 func (e *dockerExec) Promote(ctx context.Context) error {
-	return e.repo.Vacuum(ctx, &e.staging)
+	// Promotion moves the objects in the staging repository to the executor's repository.
+	// The first call to Promote moves these objects and ref counts them. Later calls are
+	// a no-op.
+	err := e.promoteOnce.Do(func() error {
+		res, err := e.Result(ctx)
+		if err != nil {
+			return err
+		}
+		return e.Executor.promote(ctx, res.Fileset, &e.staging)
+	})
+	return err
 }
 
 // Kill kills the exec's container and removes it entirely.
@@ -785,9 +866,9 @@ func (c *allCloser) Close() error {
 // Kind returns the kind of a docker error.
 func kind(err error) errors.Kind {
 	switch {
-	case client.IsErrNotFound(err):
+	case docker.IsErrNotFound(err):
 		return errors.NotExist
-	case client.IsErrUnauthorized(err):
+	case docker.IsErrUnauthorized(err):
 		return errors.NotAllowed
 	default:
 		// Liberally pick unavailable as the default error, so that lower
@@ -795,4 +876,33 @@ func kind(err error) errors.Kind {
 		// This is always safe to do, but may cause extra work.
 		return errors.Unavailable
 	}
+}
+
+// isOOMSystem checks to see if the docker exec was killed by the
+// OOM Killer.
+func (e *dockerExec) isOOMSystem() bool {
+	const dockerFmt = "2006-01-02T15:04:05.999999999Z"
+	if bootTime.IsZero() {
+		return false
+	}
+	start, err := time.Parse(dockerFmt, e.Docker.State.StartedAt)
+	if err != nil {
+		return false
+	}
+	end, err := time.Parse(dockerFmt, e.Docker.State.FinishedAt)
+	if err != nil {
+		return false
+	}
+	// TODO(dnicolaou): find another method to track OOMs that does not have a race condition
+	// between monitoring and checking.
+	// Sleep for 100 ms to minimize the chance that the oomTracker checks for an
+	// OOM before an OOM has been recorded by the oomTracker. This is a temporary fix
+	// until a better solution can be found for tracking OOMs that does not have a race
+	// condition.
+	time.Sleep(100 * time.Millisecond)
+	oomTime, ok := e.Executor.oomTracker.LastOOMKill(e.Manifest.PID)
+	if !ok {
+		return false
+	}
+	return oomTime.After(start) && !end.Before(oomTime)
 }

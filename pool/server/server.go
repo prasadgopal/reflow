@@ -155,16 +155,51 @@ func (n allocNode) Walk(ctx context.Context, call *rest.Call, path string) rest.
 			if !call.Allow("POST") {
 				return
 			}
-			var fs reflow.Fileset
-			if call.Unmarshal(&fs) != nil {
+			arg := struct {
+				Fileset reflow.Fileset
+				SrcUrl  *url.URL
+			}{}
+			if call.Unmarshal(&arg) != nil {
 				return
 			}
-			fs, err := n.a.Load(ctx, fs)
+			fs, err := n.a.Load(ctx, arg.SrcUrl, arg.Fileset)
 			if err != nil {
 				call.Error(err)
 				return
 			}
 			call.Reply(http.StatusOK, fs)
+		})
+	case "unload":
+		return rest.DoFunc(func(ctx context.Context, call *rest.Call) {
+			if !call.Allow("POST") {
+				return
+			}
+			var fs reflow.Fileset
+			if call.Unmarshal(&fs) != nil {
+				return
+			}
+			err := n.a.Unload(ctx, fs)
+			if err != nil {
+				call.Error(err)
+				return
+			}
+			call.Reply(http.StatusOK, "unloaded")
+		})
+	case "verify":
+		return rest.DoFunc(func(ctx context.Context, call *rest.Call) {
+			if !call.Allow("POST") {
+				return
+			}
+			var fs reflow.Fileset
+			if call.Unmarshal(&fs) != nil {
+				return
+			}
+			err := n.a.VerifyIntegrity(ctx, fs)
+			if err != nil {
+				call.Error(err)
+				return
+			}
+			call.Reply(http.StatusOK, "verified")
 		})
 	default:
 		return nil
@@ -309,12 +344,7 @@ func (n execNode) shellNode() rest.Node {
 }
 
 func (n execNode) Walk(ctx context.Context, call *rest.Call, path string) rest.Node {
-	u, err := url.Parse(path)
-	if err != nil {
-		call.Error(err)
-		return nil
-	}
-	switch u.Path {
+	switch path {
 	default:
 		return nil
 	case "wait":
@@ -329,11 +359,11 @@ func (n execNode) Walk(ctx context.Context, call *rest.Call, path string) rest.N
 			}
 		})
 	case "logs":
-		return n.logNode(true, true, u.Query().Get("follow"))
+		return n.logNode(true, true, call.URL().Query().Get("follow"))
 	case "stderr":
-		return n.logNode(false, true, u.Query().Get("follow"))
+		return n.logNode(false, true, call.URL().Query().Get("follow"))
 	case "stdout":
-		return n.logNode(true, false, u.Query().Get("follow"))
+		return n.logNode(true, false, call.URL().Query().Get("follow"))
 	case "shell":
 		return n.shellNode()
 	case "result":

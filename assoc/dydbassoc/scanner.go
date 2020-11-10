@@ -49,11 +49,14 @@ func (s *scanner) Scan(ctx context.Context, h ItemsHandler) error {
 
 				// Do the scan
 				params := &dynamodb.ScanInput{
-					TableName:                aws.String(s.Assoc.TableName),
-					Segment:                  aws.Int64(int64(segment)),
-					TotalSegments:            aws.Int64(int64(s.SegmentCount)),
-					FilterExpression:         aws.String("attribute_exists(#v)"),
-					ExpressionAttributeNames: map[string]*string{"#v": aws.String("Value")},
+					TableName:     aws.String(s.Assoc.TableName),
+					Segment:       aws.Int64(int64(segment)),
+					TotalSegments: aws.Int64(int64(s.SegmentCount)),
+					// Only assoc rows should have a LastAccessTime attribute. Additionally,
+					// all assoc rows have a LastAccessTime column. The attributes Value, ExecInspect,
+					// Logs, and Bundle vary depending on the type of value represented by the assoc row.
+					FilterExpression:         aws.String("attribute_exists(#l)"),
+					ExpressionAttributeNames: map[string]*string{"#l": aws.String("LastAccessTime")},
 				}
 				if lastEvaluatedKey != nil {
 					params.ExclusiveStartKey = lastEvaluatedKey
@@ -79,7 +82,9 @@ func (s *scanner) Scan(ctx context.Context, h ItemsHandler) error {
 				attempts = 0
 
 				// Call the Handler function with the Items
-				h.HandleItems(resp.Items)
+				if err = h.HandleItems(resp.Items); err != nil {
+					log.Errorf("error handling items %v", err)
+				}
 
 				// We're done if the last evaluated key is empty
 				if resp.LastEvaluatedKey == nil {

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -36,6 +37,8 @@ const (
 	ParseExpr
 	// ParseType parses a type.
 	ParseType
+	// ParsePat parses a pattern.
+	ParsePat
 )
 
 // Parser is a Reflow lexer. It composes an (internal) scanner to
@@ -49,18 +52,20 @@ type Parser struct {
 	Body io.Reader
 
 	// Mode governs how the parser is started. See documentation above.
-	// The fields Module, Decls, Expr, and Type are set depending on the
+	// The fields Module, Decls, Expr, Type, and Pat are set depending on the
 	// parser mode.
 	Mode ParserMode
 
-	// Module contains the parsed module (LexerModule).
+	// Module contains the parsed module (ParseModule).
 	Module *ModuleImpl
-	// Decls contains the parsed declarations (LexerDecls).
+	// Decls contains the parsed declarations (ParseDecls).
 	Decls []*Decl
-	// Expr contains the parsed expression (LexerExpr).
+	// Expr contains the parsed expression (ParseExpr).
 	Expr *Expr
-	// Type contains the pased type (LexerType).
+	// Type contains the parsed type (ParseType).
 	Type *types.T
+	// Pat contains the parsed pattern (ParsePat).
+	Pat *Pat
 
 	el errlist
 
@@ -105,6 +110,8 @@ func (x *Parser) init() error {
 		x.first = tokStartExpr
 	case ParseType:
 		x.first = tokStartType
+	case ParsePat:
+		x.first = tokStartPat
 	}
 	x.scanner.Error = func(_ *scanner.Scanner, msg string) { x.Error(msg) }
 	x.scanner.Filename = x.File
@@ -169,31 +176,17 @@ var identTokens = map[string]int{
 	"if":   tokIf,
 	"else": tokElse,
 
+	"switch": tokSwitch,
+	"case":   tokCase,
+
 	"make": tokMake,
-
-	"len":   tokLen,
-	"zip":   tokZip,
-	"unzip": tokUnzip,
-
-	"flatten": tokFlatten,
-
-	"map":  tokMap,
-	"list": tokList,
-
-	"panic": tokPanic,
-	"delay": tokDelay,
-	"trace": tokTrace,
 
 	"requires": tokRequires,
 
 	"type": tokType,
 
-	"range": tokRange,
-
 	// Reserved identifiers:
 	"force":   tokReserved,
-	"switch":  tokReserved,
-	"case":    tokReserved,
 	"import":  tokReserved,
 	"include": tokReserved,
 }
@@ -212,7 +205,7 @@ var tokens = map[rune]int{
 	scanner.Rsh:           tokRSH,
 	scanner.Ellipsis:      tokEllipsis,
 	scanner.SquiggleArrow: tokSquiggleArrow,
-	'@': tokAt,
+	'@':                   tokAt,
 }
 
 // insertionToks defines the sets of tokens after which
@@ -279,7 +272,7 @@ Scan:
 		case "true", "false":
 			yy.expr = &Expr{
 				Position: x.scanner.Pos(),
-				Kind:     ExprConst,
+				Kind:     ExprLit,
 				Type:     types.Bool,
 				Val:      values.T(text == "true"),
 			}
@@ -290,7 +283,7 @@ Scan:
 	case scanner.Int:
 		yy.expr = &Expr{
 			Position: pos,
-			Kind:     ExprConst,
+			Kind:     ExprLit,
 			Type:     types.Int,
 		}
 		i := new(big.Int)
@@ -304,7 +297,7 @@ Scan:
 	case scanner.Float:
 		yy.expr = &Expr{
 			Position: pos,
-			Kind:     ExprConst,
+			Kind:     ExprLit,
 			Type:     types.Float,
 		}
 		f := new(big.Float)
@@ -317,11 +310,16 @@ Scan:
 		return tokExpr
 
 	case scanner.String, scanner.RawString:
+		unquotedText, err := strconv.Unquote(text)
+		if err != nil {
+			x.Error("failed to unquote string \"" + text + "\": " + err.Error())
+			return tokError
+		}
 		yy.expr = &Expr{
 			Position: pos,
-			Kind:     ExprConst,
+			Kind:     ExprLit,
 			Type:     types.String,
-			Val:      values.T(text[1 : len(text)-1]),
+			Val:      values.T(unquotedText),
 		}
 		return tokExpr
 	case scanner.Template:
@@ -365,13 +363,22 @@ Scan:
 }
 
 func (x *Parser) scanTemplate(s string) *Template {
-	t := &Template{Text: s}
+	var (
+		t   = &Template{Text: s}
+		pos = x.scanner.Position
+	)
 	for {
 		beg := strings.Index(s, "{{")
 		if beg < 0 {
 			break
 		}
 		t.Frags = append(t.Frags, s[:beg])
+		pos.Line += strings.Count(s[:beg], "\n")
+		pos.Offset += len(s[:beg+2])
+		pos.Column += len(s[:beg+2])
+		if i := strings.LastIndex(s[:beg+2], "\n"); i >= 0 {
+			pos.Column = beg - i
+		}
 		end := strings.Index(s, "}}")
 		if end < 0 {
 			x.Error("unterminated interpolation")
@@ -384,17 +391,18 @@ func (x *Parser) scanTemplate(s string) *Template {
 		if err := lx.Parse(); err != nil {
 			for _, e := range err.(posErrors) {
 				// Adjust positions to be relative to parent lexer.
-				e.Filename = x.scanner.Pos().Filename
-				e.Position.Line += x.scanner.Pos().Line
-				e.Position.Offset += x.scanner.Pos().Offset
-				if e.Position.Line == x.scanner.Pos().Line {
-					e.Position.Column += x.scanner.Pos().Column
+				e.Filename = pos.Filename
+				e.Position.Offset += pos.Offset
+				if e.Position.Line <= 1 {
+					e.Position.Column += pos.Column
 				}
+				e.Position.Line += pos.Line - 1
 				x.el = x.el.Append(e)
 			}
 			return nil
 		}
 		t.Args = append(t.Args, lx.Expr)
+		pos.Line += strings.Count(s[beg+2:end], "\n")
 		s = s[end+2:]
 	}
 	t.Frags = append(t.Frags, s)

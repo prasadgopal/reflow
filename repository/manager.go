@@ -11,20 +11,13 @@ import (
 	"time"
 
 	"github.com/grailbio/base/data"
+	"github.com/grailbio/base/digest"
 	"github.com/grailbio/base/limiter"
 	"github.com/grailbio/base/status"
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/errors"
 	"github.com/grailbio/reflow/log"
 	"golang.org/x/sync/errgroup"
-)
-
-const (
-	// minBPS defines the lowest acceptable transfer rate.
-	minBPS = 1 << 20
-	// minTimeout defines the smallest acceptable timeout.
-	// This helps to give wiggle room for small data transfers.
-	minTimeout = 30 * time.Second
 )
 
 // Limits stores a default limits and maintains a set of overrides by
@@ -138,8 +131,8 @@ type transfer struct {
 }
 
 type transferKey struct {
-	Dest string
-	File reflow.File
+	Dest   string
+	FileID digest.Digest
 }
 
 // A Manager is used to transfer objects between repositories while
@@ -175,6 +168,7 @@ type Manager struct {
 	managerStat transferStat
 
 	transfers map[transferKey]*transfer
+	files     map[digest.Digest]reflow.File
 }
 
 // Transfer transmits a set of files between two repositories,
@@ -212,10 +206,8 @@ func (m *Manager) NeedTransfer(ctx context.Context, dst reflow.Repository, files
 		// TODO(marius): implement a batch stat call.
 		// It will be more efficient in most cases.
 		g.Go(func() error {
-			ctx, cancel := context.WithTimeout(gctx, 10*time.Second)
 			_, err := dst.Stat(ctx, file.ID)
 			lstat.Release(1)
-			cancel()
 			exists[i] = err == nil
 			if err != nil && !errors.Is(errors.NotExist, err) {
 				m.Log.Printf("stat %v %v: %v", dst, file.ID, err)
@@ -256,12 +248,13 @@ func (m *Manager) transfer(ctx context.Context, dst, src reflow.Repository, file
 		total.N++
 	}
 	start := time.Now()
-	g, ctx := errgroup.WithContext(ctx)
+	g1, g1ctx := errgroup.WithContext(ctx)
+	g2, g2ctx := errgroup.WithContext(ctx)
 	for i := range files {
 		file := files[i]
 		transfer, claimed := m.claim(dst, src, file)
 		if !claimed {
-			g.Go(func() error {
+			g2.Go(func() error {
 				// TODO(marius): this approach may tie together unrelated
 				// contexts; if one is cancelled, the other dependent transfers
 				// are also cancelled even though their contexts would permit the
@@ -269,48 +262,47 @@ func (m *Manager) transfer(ctx context.Context, dst, src reflow.Repository, file
 				select {
 				case <-transfer.C:
 					return transfer.Err
-				case <-ctx.Done():
-					return ctx.Err()
+				case <-g2ctx.Done():
+					return g2ctx.Err()
 				}
 			})
 			continue
 		}
 		m.updateStats(src, dst, waiting, stat{file.Size, 1})
-		if err := lx.Acquire(ctx, 1); err != nil {
+		if err := lx.Acquire(g1ctx, 1); err != nil {
 			m.done(dst, src, file, err)
+			if err != nil {
+				return err
+			}
 			return err
 		}
-		if err := ly.Acquire(ctx, 1); err != nil {
+		if err := ly.Acquire(g1ctx, 1); err != nil {
 			lx.Release(1)
 			m.done(dst, src, file, err)
+			if err != nil {
+				return err
+			}
 			return err
 		}
-		g.Go(func() error {
+		g1.Go(func() error {
 			stat := stat{file.Size, 1}
 			m.updateStats(src, dst, transferring, stat)
-			// Note: this is too coarse grained. It means that
-			// for large objects, we end up waiting a long time
-			// to detect stalled transfers. Instead, we should enforce
-			// transfer progress, and also introduce failure detectors
-			// between peer nodes.
-			timeout := time.Duration(file.Size/minBPS) * time.Second
-			if timeout < minTimeout {
-				timeout = minTimeout
-			}
-			ctx, cancel := context.WithTimeout(ctx, timeout)
-			err := Transfer(ctx, dst, src, file.ID)
+			err := Transfer(g1ctx, dst, src, file.ID)
 			if err != nil {
 				err = errors.E("transfer", file.ID, err)
 			}
 			m.updateStats(src, dst, done, stat)
-			cancel()
 			ly.Release(1)
 			lx.Release(1)
 			m.done(dst, src, file, err)
 			return err
 		})
 	}
-	err := g.Wait()
+	err := g1.Wait()
+	if err != nil {
+		return err
+	}
+	err = g2.Wait()
 	if err != nil {
 		return err
 	}
@@ -371,7 +363,12 @@ func (m *Manager) claim(dst, src reflow.Repository, file reflow.File) (*transfer
 	if m.transfers == nil {
 		m.transfers = make(map[transferKey]*transfer)
 	}
-	key := transferKey{key(dst), file}
+	if m.files == nil {
+		m.files = make(map[digest.Digest]reflow.File)
+	}
+	dig := file.Digest()
+	key := transferKey{key(dst), dig}
+	m.files[dig] = file
 	if t := m.transfers[key]; t != nil {
 		return t, false
 	}
@@ -382,9 +379,11 @@ func (m *Manager) claim(dst, src reflow.Repository, file reflow.File) (*transfer
 
 func (m *Manager) done(dst, src reflow.Repository, file reflow.File, err error) {
 	m.mu.Lock()
-	key := transferKey{key(dst), file}
+	dig := file.Digest()
+	key := transferKey{key(dst), dig}
 	t := m.transfers[key]
 	delete(m.transfers, key)
+	delete(m.files, dig)
 	m.mu.Unlock()
 	t.Err = err
 	close(t.C)

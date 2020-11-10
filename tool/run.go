@@ -5,123 +5,34 @@
 package tool
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	golog "log"
 	"math"
 	"os"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"time"
 
-	dockerclient "github.com/docker/docker/client"
+	"docker.io/go-docker"
 	"github.com/grailbio/base/digest"
-	"github.com/grailbio/base/state"
+	"github.com/grailbio/infra"
 	"github.com/grailbio/reflow"
+	"github.com/grailbio/reflow/assoc"
 	"github.com/grailbio/reflow/blob"
-	"github.com/grailbio/reflow/blob/s3blob"
-	"github.com/grailbio/reflow/ec2authenticator"
+	"github.com/grailbio/reflow/ec2cluster"
 	"github.com/grailbio/reflow/errors"
 	"github.com/grailbio/reflow/flow"
-	"github.com/grailbio/reflow/local"
+	reflowinfra "github.com/grailbio/reflow/infra"
 	"github.com/grailbio/reflow/log"
-	"github.com/grailbio/reflow/pool"
-	"github.com/grailbio/reflow/repository"
 	"github.com/grailbio/reflow/runner"
-	"github.com/grailbio/reflow/sched"
+	"github.com/grailbio/reflow/syntax"
+	"github.com/grailbio/reflow/taskdb"
 	"github.com/grailbio/reflow/trace"
-	"github.com/grailbio/reflow/types"
 	"github.com/grailbio/reflow/wg"
 )
-
-const maxConcurrentStreams = 2000
-
-type runConfig struct {
-	localDir       string
-	dir            string
-	local          bool
-	alloc          string
-	gc             bool
-	trace          bool
-	resources      reflow.Resources
-	resourcesFlag  string
-	cache          bool
-	nocacheextern  bool
-	recomputeempty bool
-	eval           string
-	invalidate     string
-	sched          bool
-}
-
-func (r *runConfig) Flags(flags *flag.FlagSet) {
-	flags.BoolVar(&r.local, "local", false, "execute flow on the local Docker instance")
-	flags.StringVar(&r.localDir, "localdir", "/tmp/flow", "directory where execution state is stored in local mode")
-	flags.StringVar(&r.dir, "dir", "", "directory where execution state is stored in local mode (alias for local dir for backwards compatibilty)")
-	flags.StringVar(&r.alloc, "alloc", "", "use this alloc to execute program (don't allocate a fresh one)")
-	flags.BoolVar(&r.gc, "gc", false, "enable garbage collection during evaluation")
-	flags.BoolVar(&r.trace, "trace", false, "trace flow evaluation")
-	flags.StringVar(&r.resourcesFlag, "resources", "", "override offered resources in local mode (JSON formatted reflow.Resources)")
-	flags.BoolVar(&r.nocacheextern, "nocacheextern", false, "don't cache extern ops")
-	flags.BoolVar(&r.recomputeempty, "recomputeempty", false, "recompute empty cache values")
-	flags.StringVar(&r.eval, "eval", "topdown", "evaluation strategy")
-	flags.StringVar(&r.invalidate, "invalidate", "", "regular expression for node identifiers that should be invalidated")
-	flags.BoolVar(&r.sched, "sched", false, "use scalable scheduler instead of work stealing")
-}
-
-func (r *runConfig) Err() error {
-	switch r.eval {
-	case "topdown", "bottomup":
-	default:
-		return fmt.Errorf("invalid evaluation strategy %s", r.eval)
-	}
-	if r.local {
-		if r.sched {
-			return errors.New("-sched cannot be used in local mode")
-		}
-		if r.alloc != "" {
-			return errors.New("-alloc cannot be used in local mode")
-		}
-		if r.resourcesFlag != "" {
-			if err := json.Unmarshal([]byte(r.resourcesFlag), &r.resources); err != nil {
-				return fmt.Errorf("-resources: %s", err)
-			}
-		}
-	} else {
-		if r.resourcesFlag != "" {
-			return errors.New("-resources can only be used in local mode")
-		}
-	}
-	if r.sched && r.alloc != "" {
-		return errors.New("-alloc cannot be used with -sched")
-	}
-	if r.invalidate != "" {
-		_, err := regexp.Compile(r.invalidate)
-		if err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// Configure stores the runConfig's configuration into the provided
-// EvalConfig.
-func (r *runConfig) Configure(c *flow.EvalConfig) {
-	c.NoCacheExtern = r.nocacheextern
-	c.GC = r.gc
-	c.RecomputeEmpty = r.recomputeempty
-	c.BottomUp = r.eval == "bottomup"
-	if r.invalidate != "" {
-		re := regexp.MustCompile(r.invalidate)
-		c.Invalidate = func(f *flow.Flow) bool {
-			return re.MatchString(f.Ident)
-		}
-	}
-}
 
 func (c *Cmd) run(ctx context.Context, args ...string) {
 	flags := flag.NewFlagSet("run", flag.ExitOnError)
@@ -150,7 +61,7 @@ Run exits with an error code according to evaluation status. Exit
 code 10 indicates a transient runtime error. Exit codes greater than
 10 indicate errors during program evaluation, which are likely not
 retriable.`
-	var config runConfig
+	var config RunFlags
 	config.Flags(flags)
 
 	c.Parse(flags, args, help, "run [-local] [flags] path [args]")
@@ -158,351 +69,175 @@ retriable.`
 		c.Errorln(err)
 		flags.Usage()
 	}
-
 	if flags.NArg() == 0 {
 		flags.Usage()
 	}
-	er, err := c.Eval(flags.Args())
-	if er.V1 && config.gc {
+	file, args := flags.Arg(0), flags.Args()[1:]
+	e := Eval{
+		InputArgs: flags.Args(),
+	}
+	c.must(e.Run())
+	c.must(e.ResolveImages(c.Config))
+
+	if e.V1 && config.GC {
 		log.Errorf("garbage collection disabled for v1 reflows")
-		config.gc = false
-	} else if config.sched && config.gc {
+		config.GC = false
+	} else if config.Sched && config.GC {
 		log.Errorf("garbage collection disabled for with scalable scheduling")
-		config.gc = false
+		config.GC = false
 	}
-	if err != nil {
-		c.Fatal(err)
+	if e.Main() == nil {
+		c.Fatal("module has no Main")
 	}
-	c.runCommon(ctx, config, er)
+	if !config.Sched && !config.Local && e.Main().Requirements().Equal(reflow.Requirements{}) && e.Main().Op != flow.Val {
+		c.Fatal("Main requirements unspecified; add a @requires annotation")
+	}
+	c.runCommon(ctx, config, e, file, args)
 }
 
 // runCommon is the helper function used by run commands.
-func (c *Cmd) runCommon(ctx context.Context, config runConfig, er EvalResult) {
+func (c *Cmd) runCommon(ctx context.Context, runFlags RunFlags, e Eval, file string, args []string) {
 	// In the case where a flow is immediate, we print the result and quit.
-	if er.Flow.Op == flow.Val {
-		c.Println(sprintval(er.Flow.Value, er.Type))
+	if e.Main().Op == flow.Val {
+		c.Println(sprintval(e.Main().Value, e.MainType()))
 		c.Exit(0)
 	}
-	// Construct a unique name for this run, used to identify this invocation
-	// throughout the system.
-	runID := reflow.Digester.Rand(nil)
-	c.Log.Printf("run ID: %s", runID.Short())
-	repo, err := c.Config.Repository()
-	if err != nil {
-		c.Fatal(err)
+	if runFlags.Local {
+		dir := runFlags.LocalDir
+		if runFlags.Dir != "" {
+			dir = runFlags.Dir
+		}
+		var err error
+		c.SchemaKeys[reflowinfra.Cluster] = fmt.Sprintf("localcluster,dir=%v", dir)
+		c.Config, err = c.Schema.Make(c.SchemaKeys)
+		c.must(err)
 	}
-	ass, err := c.Config.Assoc()
-	if err != nil {
-		c.Fatal(err)
+
+	ctx, cancel := context.WithCancel(ctx)
+	var tracer trace.Tracer
+	c.must(c.Config.Instance(&tracer))
+	ctx = trace.WithTracer(ctx, tracer)
+
+	var cache *reflowinfra.CacheProvider
+	c.must(c.Config.Instance(&cache))
+
+	var ass assoc.Assoc
+	if err := c.Config.Instance(&ass); runFlags.needAss {
+		c.must(err)
 	}
+	var repo reflow.Repository
+	if err := c.Config.Instance(&repo); runFlags.needRepo {
+		c.must(err)
+	}
+
+	defer cancel()
+	var (
+		result runner.State
+		err    error
+	)
+	runConfig := RunConfig{
+		Config:   c.Config,
+		Program:  file,
+		Args:     args,
+		Status:   c.Status,
+		RunFlags: runFlags,
+	}
+
+	runID := taskdb.NewRunID()
 	// Set up run transcript and log files.
 	base := c.Runbase(runID)
-	os.MkdirAll(filepath.Dir(base), 0777)
-	execfile, err := os.Create(base + ".execlog")
-	if err != nil {
+	c.must(os.MkdirAll(filepath.Dir(base), 0777))
+	var (
+		execfile, logfile, dotfile *os.File
+	)
+	if execfile, err = os.Create(base + ".execlog"); err != nil {
 		c.Fatal(err)
 	}
 	defer execfile.Close()
-	logfile, err := os.Create(base + ".syslog")
-	if err != nil {
+	if logfile, err = os.Create(base + ".syslog"); err != nil {
 		c.Fatal(err)
 	}
 	defer logfile.Close()
+
+	if dotfile, err = os.Create(base + ".gv"); err != nil {
+		c.Fatal(err)
+	}
+	defer dotfile.Close()
 
 	// execLogger is the target for exec status; we also output
 	// this to the main logger's outputter. The file-based log always
 	// gets debug logs.
 	execLogger := c.Log.Tee(golog.New(execfile, "", golog.LstdFlags), "")
 	execLogger.Level = log.DebugLevel
+
 	// Additionally, save logs to the run's log file.
 	saveOut := c.Log.Outputter
-	c.Log.Outputter = log.MultiOutputter(saveOut, golog.New(logfile, "", golog.LstdFlags))
+	syslog := golog.New(logfile, "", golog.LstdFlags)
+	c.Log.Outputter = log.MultiOutputter(saveOut, syslog)
 	defer func() {
 		c.Log.Outputter = saveOut
 	}()
-	path, err := filepath.Abs(er.Program)
-	if err != nil {
-		log.Errorf("abs %s: %v", er.Program, err)
-		path = er.Program
-	}
-	cmdline := path
-	var b bytes.Buffer
-	fmt.Fprintf(&b, "evaluating program %s", path)
-	if len(er.Params) > 0 {
-		var keys []string
-		for key := range er.Params {
-			keys = append(keys, key)
+
+	if !runConfig.RunFlags.Local {
+		// make sure cluster logs go to the syslog.
+		var ec *ec2cluster.Cluster
+		if err = c.Config.Instance(&ec); err == nil {
+			saveOut := ec.Log
+			ec.Log = ec.Log.Tee(syslog, "")
+			defer func() {
+				ec.Log = saveOut
+			}()
 		}
-		sort.Strings(keys)
-		fmt.Fprintf(&b, "\n\tparams:")
-		for _, key := range keys {
-			fmt.Fprintf(&b, "\n\t\t%s=%s", key, er.Params[key])
-			cmdline += fmt.Sprintf(" -%s=%s", key, er.Params[key])
-		}
-	} else {
-		fmt.Fprintf(&b, "\n\t(no params)")
 	}
-	if len(er.Args) > 0 {
-		fmt.Fprintf(&b, "\n\targuments:")
-		for _, arg := range er.Args {
-			fmt.Fprintf(&b, "\n\t%s", arg)
-			cmdline += fmt.Sprintf(" %s", arg)
-		}
-	} else {
-		fmt.Fprintf(&b, "\n\t(no arguments)")
-	}
-	c.Log.Debug(b.String())
-	ctx, cancel := context.WithCancel(ctx)
-	tracer, err := c.Config.Tracer()
+	runConfig.RunFlags.Cluster, err = clusterInstance(c.Config, c.Status)
+	c.must(err)
+	r, err := NewRunner(ctx, runConfig, c.Log)
 	if err != nil {
 		c.Fatal(err)
 	}
-	ctx = trace.WithTracer(ctx, tracer)
-	defer cancel()
-	if config.local {
-		c.runLocal(ctx, config, execLogger, runID, er.Flow, er.Type, er.ImageMap, cmdline)
-		return
-	}
-
-	// Default case: execute on cluster with shared cache.
-	// TODO: get rid of profile here
-	cluster := c.Cluster(c.Status.Group("ec2cluster"))
-	transferer := &repository.Manager{
-		Status:           c.Status.Group("transfers"),
-		PendingTransfers: repository.NewLimits(c.TransferLimit()),
-		Stat:             repository.NewLimits(statLimit),
-		Log:              c.Log,
-	}
-	if repo != nil {
-		transferer.PendingTransfers.Set(repo.URL().String(), int(^uint(0)>>1))
-	}
-	var scheduler *sched.Scheduler
-	var wg wg.WaitGroup
-	// TODO(marius): teardown is too complicated
-	var donecancel func()
-	if config.sched {
-		scheduler = sched.New()
-		scheduler.Transferer = transferer
-		scheduler.Repository = repo
-		scheduler.Cluster = cluster
-		scheduler.Log = c.Log
-		scheduler.MinAlloc.Max(scheduler.MinAlloc, er.Flow.Requirements().Min)
-		var schedctx context.Context
-		schedctx, donecancel = context.WithCancel(ctx)
-		wg.Add(1)
-		go func() {
-			err := scheduler.Do(schedctx)
-			if err != nil && err != schedctx.Err() {
-				c.Log.Printf("scheduler: %v", err)
+	if !r.runConfig.RunFlags.Local {
+		c.onexit(func() {
+			if err = r.clusterShutdown(); err != nil {
+				r.Log.Errorf("cluster shutdown: %v", err)
 			}
-			wg.Done()
-		}()
+		})
 	}
-	run := runner.Runner{
-		Flow: er.Flow,
-		EvalConfig: flow.EvalConfig{
-			Log:         execLogger,
-			Repository:  repo,
-			Snapshotter: c.blob(),
-			Assoc:       ass,
-			CacheMode:   c.Config.CacheMode(),
-			Transferer:  transferer,
-			Status:      c.Status.Group(runID.Short()),
-			Scheduler:   scheduler,
-			ImageMap:    er.ImageMap,
-		},
-		Type:    er.Type,
-		Labels:  make(pool.Labels),
-		Cluster: cluster,
-		Cmdline: cmdline,
-	}
-	config.Configure(&run.EvalConfig)
-	run.ID = runID
-	run.Program = er.Program
-	run.Params = er.Params
-	run.Args = er.Args
-	if config.trace {
-		run.Trace = c.Log
-	}
-	if config.alloc != "" {
-		run.AllocID = config.alloc
-		run.Phase = runner.Eval
-	}
-	statefile, err := state.Open(base)
+	// Tee the exec logs in a separate (.execlog) file.
+	r.Log = execLogger
+	r.RunID = runID
+	r.DotWriter = dotfile
+
+	result, err = r.Go(ctx)
 	if err != nil {
-		c.Fatalf("failed to open state file: %v", err)
+		c.Errorln(err)
+		c.Exit(1)
 	}
-	if err := statefile.Marshal(run.State); err != nil {
-		c.Log.Errorf("failed to marshal state: %v", err)
-	}
-	ctx, bgcancel := flow.WithBackground(ctx, &wg)
-	for ok := true; ok; {
-		ok = run.Do(ctx)
-		if run.State.Phase == runner.Retry {
-			c.Log.Printf("retrying error %v", run.State.Err)
-		}
-		c.Log.Debugf("run state: %s\n", run.State)
-		if err := statefile.Marshal(run.State); err != nil {
-			c.Log.Errorf("failed to marshal state: %v", err)
-		}
-	}
-	if run.Err != nil {
-		c.Errorln(run.Err)
-	} else {
-		c.Println(run.Result)
-	}
-	if donecancel != nil {
-		donecancel()
-	}
-	c.WaitForBackgroundTasks(&wg, 10*time.Minute)
-	bgcancel()
-	cancel()
-	if run.Err != nil {
-		if errors.Is(errors.Eval, run.Err) {
-			// Error that occured during evaluation. Probably not recoverable.
+	if result.Err != nil {
+		if errors.Is(errors.Eval, result.Err) {
+			// Error that occurred during evaluation. Probably not recoverable.
 			// TODO(marius): if this was caused by an underyling exit (from a tool)
 			// then propagate this here.
 			c.Exit(11)
 		}
-		if errors.Restartable(run.Err) {
+		if errors.Restartable(result.Err) {
 			c.Exit(10)
 		}
 		c.Exit(1)
 	}
-}
-
-func (c *Cmd) runLocal(ctx context.Context, config runConfig, execLogger *log.Logger, runID digest.Digest, f *flow.Flow, typ *types.T, imageMap map[string]string, cmdline string) {
-	addr := os.Getenv("DOCKER_HOST")
-	if addr == "" {
-		addr = "unix:///var/run/docker.sock"
-	}
-	client, err := dockerclient.NewClient(
-		addr, "1.22", /*client.DefaultVersion*/
-		nil, map[string]string{"user-agent": "reflow"})
-	if err != nil {
-		c.Fatal(err)
-	}
-	repo, err := c.Config.Repository()
-	if err != nil {
-		c.Fatal(err)
-	}
-	ass, err := c.Config.Assoc()
-	if err != nil {
-		c.Fatal(err)
-	}
-	sess, err := c.Config.AWS()
-	if err != nil {
-		c.Fatal(err)
-	}
-	creds, err := c.Config.AWSCreds()
-	if err != nil {
-		c.Fatal(err)
-	}
-	awstool, err := c.Config.AWSTool()
-	if err != nil {
-		c.Fatal(err)
-	}
-	transferer := &repository.Manager{
-		Status:           c.Status.Group("transfers"),
-		PendingTransfers: repository.NewLimits(c.TransferLimit()),
-		Stat:             repository.NewLimits(statLimit),
-		Log:              c.Log,
-	}
-	if repo != nil {
-		transferer.PendingTransfers.Set(repo.URL().String(), int(^uint(0)>>1))
-	}
-	dir := config.localDir
-	if config.dir != "" {
-		dir = config.dir
-	}
-	x := &local.Executor{
-		Client:        client,
-		Dir:           dir,
-		Authenticator: ec2authenticator.New(sess),
-		AWSImage:      awstool,
-		AWSCreds:      creds,
-		Blob:          c.blob(),
-		Log:           c.Log.Tee(nil, "executor: "),
-	}
-
-	resources := config.resources
-	if resources.Equal(nil) {
-		info, err := client.Info(context.Background())
-		if err != nil {
-			log.Fatal(err)
-		}
-		resources = reflow.Resources{
-			"mem":  math.Floor(float64(info.MemTotal) * 0.95),
-			"cpu":  float64(info.NCPU),
-			"disk": 1e13, // Assume 10TB. TODO(marius): real disk management
-		}
-	}
-	x.SetResources(resources)
-
-	if err := x.Start(); err != nil {
-		log.Fatal(err)
-	}
-	evalConfig := flow.EvalConfig{
-		Executor:    x,
-		Snapshotter: c.blob(),
-		Transferer:  transferer,
-		Log:         execLogger,
-		Repository:  repo,
-		Assoc:       ass,
-		CacheMode:   c.Config.CacheMode(),
-		Status:      c.Status.Group(runID.Short()),
-		ImageMap:    imageMap,
-	}
-	config.Configure(&evalConfig)
-	if config.trace {
-		evalConfig.Trace = c.Log
-	}
-	eval := flow.NewEval(f, evalConfig)
-	var wg wg.WaitGroup
-	ctx, bgcancel := flow.WithBackground(ctx, &wg)
-	ctx, done := trace.Start(ctx, trace.Run, f.Digest(), cmdline)
-	c.onexit(done)
-	traceid := trace.URL(ctx)
-	if len(traceid) > 0 {
-		c.Log.Printf("Trace ID: %v", traceid)
-	}
-	if err = eval.Do(ctx); err != nil {
-		c.Errorln(err)
-		if errors.Restartable(err) {
-			c.Exit(10)
-		}
-		c.Exit(1)
-	}
-	c.WaitForBackgroundTasks(&wg, 10*time.Minute)
-	bgcancel()
-	if err := eval.Err(); err != nil {
-		c.Errorln(err)
-		c.Exit(11)
-	}
-	eval.LogSummary(c.Log)
-	c.Println(sprintval(eval.Value(), typ))
-	c.Exit(0)
 }
 
 // rundir returns the directory that stores run state, creating it if necessary.
 func (c *Cmd) rundir() string {
-	var rundir string
-	if home, ok := os.LookupEnv("HOME"); ok {
-		rundir = filepath.Join(home, ".reflow", "runs")
-		os.MkdirAll(rundir, 0777)
-	} else {
-		var err error
-		rundir, err = ioutil.TempDir("", "prefix")
-		if err != nil {
-			c.Fatalf("failed to create temporary directory: %v", err)
-		}
+	rundir, err := rundir()
+	if err != nil {
+		c.Fatalf("failed to create temporary directory: %v", err)
 	}
 	return rundir
 }
 
-// runbase returns the base path for the run with the provided name
-func (c Cmd) Runbase(id digest.Digest) string {
-	return filepath.Join(c.rundir(), id.Hex())
+// Runbase returns the base path for the run with the provided name
+func (c Cmd) Runbase(runID taskdb.RunID) string {
+	return runbase(c.rundir(), runID)
 }
 
 // WaitForBackgroundTasks waits until all background tasks complete, or if the provided
@@ -525,13 +260,75 @@ func (c Cmd) WaitForBackgroundTasks(wg *wg.WaitGroup, timeout time.Duration) {
 	}
 }
 
-// Blob returns the configured blob muxer.
-func (c Cmd) blob() blob.Mux {
-	sess, err := c.Config.AWS()
+// AssertionGenerator returns the configured AssertionGenerator mux.
+func assertionGenerator(config infra.Config) (reflow.AssertionGeneratorMux, error) {
+	mux := make(reflow.AssertionGeneratorMux)
+	var err error
+	mux[blob.AssertionsNamespace], err = blobMux(config)
+	return mux, err
+}
+
+// asserter returns a reflow.Assert based on the given name.
+func asserter(name string) (reflow.Assert, error) {
+	switch name {
+	case "never":
+		return reflow.AssertNever, nil
+	case "exact":
+		return reflow.AssertExact, nil
+	default:
+		return nil, fmt.Errorf("unknown Assert policy %s", name)
+	}
+}
+
+func dockerClient() (*docker.Client, reflow.Resources, error) {
+	addr := os.Getenv("DOCKER_HOST")
+	if addr == "" {
+		addr = "unix:///var/run/docker.sock"
+	}
+	client, err := docker.NewClient(
+		addr, "1.22", /*client.DefaultVersion*/
+		nil, map[string]string{"user-agent": "reflow"})
 	if err != nil {
-		c.Fatal(err)
+		return nil, nil, err
 	}
-	return blob.Mux{
-		"s3": s3blob.New(sess),
+	info, err := client.Info(context.Background())
+	if err != nil {
+		return nil, nil, err
 	}
+	resources := reflow.Resources{
+		"mem":  math.Floor(float64(info.MemTotal) * 0.95),
+		"cpu":  float64(info.NCPU),
+		"disk": 1e13, // Assume 10TB. TODO(marius): real disk management
+	}
+	return client, resources, nil
+}
+
+func getBundle(file string) (io.ReadCloser, digest.Digest, error) {
+	dw := reflow.Digester.NewWriter()
+	f, err := os.Open(file)
+	if err != nil {
+		return nil, digest.Digest{}, err
+	}
+	if _, err = io.Copy(dw, f); err != nil {
+		return nil, digest.Digest{}, err
+	}
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		return nil, digest.Digest{}, err
+	}
+	return f, dw.Digest(), nil
+}
+
+func makeBundle(b *syntax.Bundle) (io.ReadCloser, digest.Digest, string, error) {
+	dw := reflow.Digester.NewWriter()
+	f, err := ioutil.TempFile("", "")
+	if err != nil {
+		return nil, digest.Digest{}, "", err
+	}
+	if err = b.WriteTo(io.MultiWriter(dw, f)); err != nil {
+		return nil, digest.Digest{}, "", err
+	}
+	if _, err = f.Seek(0, io.SeekStart); err != nil {
+		return nil, digest.Digest{}, "", err
+	}
+	return f, dw.Digest(), f.Name(), nil
 }

@@ -27,7 +27,7 @@ func expand(t *types.T, env *types.Env) *types.T {
 			u = u.Copy()
 			// Carry the path for pretty printing.
 			u.Path = t.Path
-			return types.Promote(u)
+			return u
 		default:
 			var u *types.T
 			for i, el := range t.Path {
@@ -53,7 +53,7 @@ func expand(t *types.T, env *types.Env) *types.T {
 			u = u.Copy()
 			// Carry the path for pretty printing.
 			u.Path = t.Path
-			return types.Promote(u)
+			return u
 		}
 	}
 
@@ -73,6 +73,15 @@ func expand(t *types.T, env *types.Env) *types.T {
 			}
 		}
 	}
+	if t.Variants != nil {
+		u.Variants = make([]*types.Variant, len(t.Variants))
+		for i, variant := range t.Variants {
+			u.Variants[i] = &types.Variant{Tag: variant.Tag}
+			if variant.Elem != nil {
+				u.Variants[i].Elem = expand(variant.Elem, env)
+			}
+		}
+	}
 	if t.Aliases != nil {
 		u.Aliases = make([]*types.Field, len(t.Aliases))
 		for i, f := range t.Aliases {
@@ -82,5 +91,5 @@ func expand(t *types.T, env *types.Env) *types.T {
 			}
 		}
 	}
-	return types.Promote(u)
+	return types.Make(u)
 }

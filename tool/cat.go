@@ -20,10 +20,9 @@ func (c *Cmd) cat(ctx context.Context, args ...string) {
 	if flags.NArg() == 0 {
 		flags.Usage()
 	}
-	repo, err := c.Config.Repository()
-	if err != nil {
-		c.Fatal(err)
-	}
+	var repo reflow.Repository
+	c.must(c.Config.Instance(&repo))
+
 	var ids []digest.Digest
 	for _, arg := range flags.Args() {
 		id, err := reflow.Digester.Parse(arg)

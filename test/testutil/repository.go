@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
+	"math/rand"
 	"net/url"
 	"reflect"
 	"sync"
@@ -28,14 +30,41 @@ import (
 type InmemoryRepository struct {
 	mu    sync.Mutex
 	files map[digest.Digest][]byte
+	url   *url.URL
 }
+
+var (
+	inmemoryReposMapOnce sync.Once
+	inmemoryReposMu      sync.Mutex
+	inmemoryReposMap     map[string]*InmemoryRepository
+)
 
 // NewInmemoryRepository returns a new repository that stores objects
 // in memory.
 func NewInmemoryRepository() *InmemoryRepository {
-	return &InmemoryRepository{
-		files: map[digest.Digest][]byte{},
+	inmemoryReposMapOnce.Do(func() {
+		inmemoryReposMap = make(map[string]*InmemoryRepository)
+	})
+	host := fmt.Sprintf("%d", rand.Int63())
+	url, err := url.Parse(fmt.Sprint("inmemory://", host))
+	if err != nil {
+		log.Printf("url parse: %v", err)
+		return nil
 	}
+	repo := &InmemoryRepository{
+		files: map[digest.Digest][]byte{},
+		url:   url,
+	}
+	inmemoryReposMu.Lock()
+	inmemoryReposMap[host] = repo
+	inmemoryReposMu.Unlock()
+	return repo
+}
+
+func GetInMemoryRepository(repo *url.URL) *InmemoryRepository {
+	inmemoryReposMu.Lock()
+	defer inmemoryReposMu.Unlock()
+	return inmemoryReposMap[repo.Host]
 }
 
 func (r *InmemoryRepository) get(k digest.Digest) []byte {
@@ -90,7 +119,7 @@ func (r *InmemoryRepository) Put(_ context.Context, rd io.Reader) (digest.Digest
 // CollectWithThreshold removes from this repository any objects not in the
 // Liveset and whose creation times are not more recent than the
 // threshold time.
-func (r *InmemoryRepository) CollectWithThreshold(ctx context.Context, live liveset.Liveset, threshold time.Time, dryRun bool) error {
+func (r *InmemoryRepository) CollectWithThreshold(ctx context.Context, live liveset.Liveset, dead liveset.Liveset, threshold time.Time, dryRun bool) error {
 	return errors.E("collectwiththreshold", errors.NotSupported)
 }
 
@@ -118,7 +147,37 @@ func (r *InmemoryRepository) ReadFrom(_ context.Context, id digest.Digest, u *ur
 
 // URL returns a nil URL.
 func (r *InmemoryRepository) URL() *url.URL {
-	return nil
+	return r.url
+}
+
+// InmemoryRepository is an in-memory repository used for testing which also implements scheduler.blobLocator.
+type InmemoryLocatorRepository struct {
+	*InmemoryRepository
+	locations map[digest.Digest]string
+}
+
+// NewInmemoryLocatorRepository returns a new repository that stores objects
+// in memory.
+func NewInmemoryLocatorRepository() *InmemoryLocatorRepository {
+	return &InmemoryLocatorRepository{
+		InmemoryRepository: NewInmemoryRepository(),
+		locations:          map[digest.Digest]string{},
+	}
+}
+
+func (r *InmemoryLocatorRepository) SetLocation(k digest.Digest, loc string) {
+	r.mu.Lock()
+	r.locations[k] = loc
+	r.mu.Unlock()
+}
+
+// Implement scheduler.blobLocator
+func (r *InmemoryLocatorRepository) Location(ctx context.Context, id digest.Digest) (string, error) {
+	loc := r.locations[id]
+	if loc == "" {
+		return "", errors.E(errors.NotExist, fmt.Errorf("unknown %v", id))
+	}
+	return loc, nil
 }
 
 // RepositoryCallKind indicates the type of repository call.
@@ -131,6 +190,7 @@ const (
 	RepositoryStat
 	RepositoryWriteTo
 	RepositoryReadFrom
+	RepositoryGetFile
 )
 
 // RepositoryCall describes a single call to a Repository: its
@@ -147,6 +207,7 @@ type RepositoryCall struct {
 	ReplyFile       reflow.File
 	ReplyErr        error
 	ReplyReadCloser io.ReadCloser
+	ReplyN          int64
 }
 
 // ExpectRepository is a Repository implementation used for
@@ -248,7 +309,7 @@ func (r *ExpectRepository) ReadFrom(_ context.Context, id digest.Digest, u *url.
 // CollectWithThreshold removes from this repository any objects not in the
 // Liveset and whose creation times are not more recent than the
 // threshold time.
-func (r *ExpectRepository) CollectWithThreshold(ctx context.Context, live liveset.Liveset, threshold time.Time, dryRun bool) error {
+func (r *ExpectRepository) CollectWithThreshold(ctx context.Context, live liveset.Liveset, dead liveset.Liveset, threshold time.Time, dryRun bool) error {
 	return errors.E("collectwiththreshold", errors.NotSupported)
 }
 
@@ -259,6 +320,20 @@ func (*ExpectRepository) Collect(context.Context, liveset.Liveset) error {
 
 // URL returns the repository's URL.
 func (r *ExpectRepository) URL() *url.URL { return r.RepoURL }
+
+// ExpectGetFilerRepository is an ExpectRepository which also implements GetFile.
+type ExpectGetFilerRepository struct {
+	*ExpectRepository
+}
+
+// GetFile implements the repository's GetFile call.
+func (r *ExpectGetFilerRepository) GetFile(_ context.Context, id digest.Digest, w io.WriterAt) (int64, error) {
+	call := RepositoryCall{Kind: RepositoryGetFile, ArgID: id}
+	if err := r.call(&call); err != nil {
+		return 0, err
+	}
+	return call.ReplyN, call.ReplyErr
+}
 
 // panicRepository is an unimplemented Repository.
 type panicRepository struct{}
@@ -281,7 +356,7 @@ func (*panicRepository) ReadFrom(context.Context, digest.Digest, *url.URL) error
 func (*panicRepository) Collect(context.Context, liveset.Liveset) error {
 	panic("not implemented")
 }
-func (*panicRepository) CollectWithThreshold(ctx context.Context, live liveset.Liveset, threshold time.Time, dryRun bool) error {
+func (*panicRepository) CollectWithThreshold(ctx context.Context, live liveset.Liveset, dead liveset.Liveset, threshold time.Time, dryRun bool) error {
 	panic("not implemented")
 }
 func (*panicRepository) URL() *url.URL { panic("not implemented") }
@@ -322,7 +397,7 @@ func NewWaitRepository(rawurl string) *WaitRepository {
 // CollectWithThreshold removes from this repository any objects not in the
 // Liveset and whose creation times are not more recent than the
 // threshold time.
-func (r *WaitRepository) CollectWithThreshold(ctx context.Context, live liveset.Liveset, threshold time.Time, dryRun bool) error {
+func (r *WaitRepository) CollectWithThreshold(ctx context.Context, live liveset.Liveset, dead liveset.Liveset, threshold time.Time, dryRun bool) error {
 	panic("not implemented")
 }
 

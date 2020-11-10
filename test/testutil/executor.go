@@ -7,11 +7,14 @@ package testutil
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"io/ioutil"
 	"sync"
 
 	"github.com/grailbio/base/digest"
+	"github.com/grailbio/base/sync/ctxsync"
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/errors"
 	"github.com/grailbio/reflow/flow"
@@ -77,10 +80,18 @@ func (e *Exec) Wait(ctx context.Context) error {
 	return err
 }
 
-// Logs is a no-op for the test exec.
+// Logs returns a ReadCloser for the exec.
 func (e *Exec) Logs(ctx context.Context, stdout bool, stderr bool, follow bool) (io.ReadCloser, error) {
 	_, err := e.result(ctx)
-	return ioutil.NopCloser(bytes.NewBufferString("")), err
+	rc := ioutil.NopCloser(bytes.NewBufferString(""))
+	if follow {
+		b, marshalErr := json.Marshal("following")
+		if marshalErr != nil {
+			return rc, marshalErr
+		}
+		rc = ioutil.NopCloser(bytes.NewReader(b))
+	}
+	return rc, err
 }
 
 // Shell is not implemented
@@ -129,20 +140,20 @@ func (e *Exec) result(ctx context.Context) (ExecResult, error) {
 
 // Executor implements Executor for testing purposes. It allows the
 // caller to await creation of Execs, to introspect execs in the
-// exeutor, and to set exec results.
+// executor, and to set exec results.
 type Executor struct {
 	reflow.Executor
 	Have reflow.Resources
 
 	Repo  reflow.Repository
 	mu    sync.Mutex
-	cond  *sync.Cond
+	cond  *ctxsync.Cond
 	execs map[digest.Digest]*Exec
 }
 
 // Init initializes the test executor.
 func (e *Executor) Init() {
-	e.cond = sync.NewCond(&e.mu)
+	e.cond = ctxsync.NewCond(&e.mu)
 	e.execs = map[digest.Digest]*Exec{}
 	e.Repo = &panicRepository{}
 }
@@ -169,9 +180,15 @@ func (e *Executor) Get(ctx context.Context, id digest.Digest) (reflow.Exec, erro
 	return x, nil
 }
 
-// Remove is not implemented.
-func (*Executor) Remove(ctx context.Context, id digest.Digest) error {
-	panic("not implemented")
+// Remove removes the exec with id if it exists or returns an error.
+func (e *Executor) Remove(ctx context.Context, id digest.Digest) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, ok := e.execs[id]; !ok {
+		return errors.E("testutil.Executor", id, errors.NotExist)
+	}
+	delete(e.execs, id)
+	return nil
 }
 
 // Execs enumerates the execs managed by this executor.
@@ -199,14 +216,22 @@ func (e *Executor) Repository() reflow.Repository {
 	return e.Repo
 }
 
+// flowId computes the exec id for this flow.
+func (e *Executor) flowId(f *flow.Flow) digest.Digest {
+	if f.ExecId.IsZero() {
+		panic(fmt.Errorf("no exec id set for flow %v", f))
+	}
+	return f.ExecId
+}
+
 // Equiv tells whether this executor contains precisely a set of flows.
 func (e *Executor) Equiv(flows ...*flow.Flow) bool {
 	ids := map[digest.Digest]bool{}
-	for _, f := range flows {
-		ids[f.Digest()] = true
-	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	for _, f := range flows {
+		ids[e.flowId(f)] = true
+	}
 	for id := range e.execs {
 		if !ids[id] {
 			return false
@@ -217,49 +242,78 @@ func (e *Executor) Equiv(flows ...*flow.Flow) bool {
 }
 
 // Exec rendeszvous the Exec for the provided flow.
-func (e *Executor) Exec(f *flow.Flow) *Exec {
+func (e *Executor) Exec(ctx context.Context, f *flow.Flow) *Exec {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for {
-		if x := e.execs[f.Digest()]; x != nil {
+		if x := e.execs[e.flowId(f)]; x != nil {
 			return x
 		}
-		e.cond.Wait()
+		if err := e.cond.Wait(ctx); err != nil {
+			panic(fmt.Sprintf("ctx done waiting for result %v: %v", f, err))
+		}
 	}
 }
 
 // Wait blocks until a Flow is defined in the executor.
-func (e *Executor) Wait(f *flow.Flow) {
-	e.Exec(f)
+func (e *Executor) Wait(ctx context.Context, f *flow.Flow) {
+	e.Exec(ctx, f)
+}
+
+// Pending returns whether the flow f has a pending execution.
+func (e *Executor) Pending(f *flow.Flow) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	_, ok := e.execs[e.flowId(f)]
+	return ok
 }
 
 // WaitAny returns the first of flows to be defined.
-func (e *Executor) WaitAny(flows ...*flow.Flow) *flow.Flow {
+func (e *Executor) WaitAny(ctx context.Context, flows ...*flow.Flow) *flow.Flow {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for {
 		for _, flow := range flows {
-			if e.execs[flow.Digest()] != nil {
+			if e.execs[e.flowId(flow)] != nil {
 				return flow
 			}
 		}
-		e.cond.Wait()
+		if err := e.cond.Wait(ctx); err != nil {
+			panic(fmt.Sprintf("ctx done waiting for result %v: %v", flows, err))
+		}
 	}
 }
 
 // Ok defines a successful result for a Flow.
-func (e *Executor) Ok(f *flow.Flow, res interface{}) {
+func (e *Executor) Ok(ctx context.Context, f *flow.Flow, res interface{}) {
 	switch arg := res.(type) {
 	case reflow.Fileset:
-		e.Exec(f).Ok(reflow.Result{Fileset: arg})
+		e.Exec(ctx, f).Ok(reflow.Result{Fileset: arg})
 	case error:
-		e.Exec(f).Ok(reflow.Result{Err: errors.Recover(arg)})
+		e.Exec(ctx, f).Ok(reflow.Result{Err: errors.Recover(arg)})
 	default:
 		panic("invalid result")
 	}
 }
 
 // Error defines an erroneous result for the flow.
-func (e *Executor) Error(f *flow.Flow, err error) {
-	e.Exec(f).Error(err)
+func (e *Executor) Error(ctx context.Context, f *flow.Flow, err error) {
+	e.Exec(ctx, f).Error(err)
+}
+
+// AssignExecId assigns ExecIds for the given set of flows using the given assertions.
+func AssignExecId(a *reflow.Assertions, flows ...*flow.Flow) {
+	if a == nil {
+		a = new(reflow.Assertions)
+	}
+	for _, f := range flows {
+		f.ExecId = reflow.Digester.FromDigests(f.Digest(), a.Digest())
+	}
+}
+
+// AssignExecIdRandom assigns random ExecIds for the given set of flows.
+func AssignExecIdRandom(flows ...*flow.Flow) {
+	for _, f := range flows {
+		f.ExecId = reflow.Digester.Rand(nil)
+	}
 }

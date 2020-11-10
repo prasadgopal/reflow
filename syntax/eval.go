@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net/url"
 	"os"
 	"runtime/debug"
 	"strings"
@@ -29,6 +30,7 @@ var (
 	errMatch               = errors.New("match error")
 	compareDigest          = reflow.Digester.FromString("grail.com/reflow/syntax.evalEq")
 	one                    = big.NewInt(1)
+	errParam               = errors.New("flag parameters may not depend on other flag parameters")
 )
 
 // Eval evaluates the expression e and returns its value (or error).
@@ -122,10 +124,14 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 			if !ok {
 				return right, nil
 			}
+			flowDigest := sequenceDigest
+			if rightFlow, ok := right.(*flow.Flow); ok {
+				flowDigest.Mix(rightFlow.Digest())
+			}
 			return &flow.Flow{
 				Deps:       []*flow.Flow{leftFlow},
 				Op:         flow.K,
-				FlowDigest: sequenceDigest,
+				FlowDigest: flowDigest,
 				K: func(vs []values.T) *flow.Flow {
 					if f, ok := right.(*flow.Flow); ok {
 						return f
@@ -140,7 +146,8 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 		case "==", "!=":
 			eq := e.Op == "=="
 			switch e.Left.Type.Kind {
-			case types.ListKind, types.MapKind, types.TupleKind, types.StructKind:
+			case types.ListKind, types.MapKind, types.TupleKind, types.StructKind, types.DirKind,
+				types.SumKind:
 				return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 					v, err := e.evalEq(sess, env, ident, vs[0], vs[1], e.Left.Type)
 					if err != nil {
@@ -150,6 +157,58 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 						v, err = not(v)
 					}
 					return v, err
+				}, e.Left, e.Right)
+			case types.FileKind:
+				comp := func(vs []values.T) (values.T, error) {
+					v, err := e.evalEq(sess, env, ident, vs[0], vs[1], e.Left.Type)
+					if err != nil {
+						return nil, err
+					}
+					if !eq {
+						v, err = not(v)
+					}
+					return v, err
+				}
+				forceIntern := func(src string) (values.T, error) {
+					url, err := url.Parse(src)
+					if err != nil {
+						return nil, err
+					}
+					return &flow.Flow{
+						Op:         flow.Coerce,
+						FlowDigest: coerceFilesetToFileDigest,
+						Coerce:     coerceFilesetToFile,
+						Deps: []*flow.Flow{
+							{
+								Op:         flow.Intern,
+								MustIntern: true,
+								URL:        url,
+								Position:   e.Position.String(),
+								Ident:      ident,
+							},
+						},
+					}, nil
+				}
+				return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
+					l, r := vs[0].(reflow.File), vs[1].(reflow.File)
+					if l.IsRef() != r.IsRef() {
+						left, right := vs[0], vs[1]
+						if l.IsRef() {
+							left, err = forceIntern(l.Source)
+							if err != nil {
+								return nil, err
+							}
+						} else {
+							right, err = forceIntern(r.Source)
+							if err != nil {
+								return nil, err
+							}
+						}
+						return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
+							return comp(vs)
+						}, tval{e.Left.Type, left}, tval{e.Right.Type, right})
+					}
+					return comp(vs)
 				}, e.Left, e.Right)
 			default:
 				return e.k(sess, env, ident, e.evalBinop, e.Left, e.Right)
@@ -172,7 +231,7 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 			}
 			return fn.Apply(values.Location{Position: e.Position.String(), Ident: ident}, fields)
 		}, e.Left)
-	case ExprConst:
+	case ExprLit:
 		return e.Val, nil
 	case ExprAscribe:
 		return e.Left.eval(sess, env, ident)
@@ -184,12 +243,14 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 				return nil, err
 			}
 			env = env.Push()
-			for id, m := range d.Pat.Matchers() {
+			for _, m := range d.Pat.Matchers() {
 				w, err := coerceMatch(v, d.Type, d.Pat.Position, m.Path())
 				if err != nil {
 					return nil, err
 				}
-				env.Bind(id, w)
+				if m.Ident != "" {
+					env.Bind(m.Ident, w)
+				}
 			}
 		}
 		return e.Left.eval(sess, env, ident)
@@ -236,7 +297,7 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 		}
 		return e.k(sess, env, ident,
 			func(vs []values.T) (values.T, error) {
-				m := make(values.Map)
+				m := new(values.Map)
 				for i, k := range vs {
 					v, err := e.Map[sortedKeys[i]].eval(sess, env, ident)
 					if err != nil {
@@ -247,198 +308,86 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 				return m, nil
 			},
 			keys...)
+	case ExprVariant:
+		if e.Left == nil {
+			return &values.Variant{Tag: e.Ident}, nil
+		}
+		v, err := e.Left.eval(sess, env, ident)
+		if err != nil {
+			return nil, err
+		}
+		return &values.Variant{Tag: e.Ident, Elem: v}, nil
 	case ExprExec:
-		// Execs are special. The interpolation environment also has the
-		// output ids.
-		narg := len(e.Template.Args)
-		outputs := map[string]*types.T{}
-		for _, f := range e.Type.Tupled().Fields {
-			outputs[f.Name] = f.T
-		}
-		varg := make([]values.T, narg)
-		for i, ae := range e.Template.Args {
-			if ae.Kind == ExprIdent && outputs[ae.Ident] != nil {
-				continue
-			}
-			var err error
-			varg[i], err = ae.eval(sess, env, ident)
-			if err != nil {
-				return nil, err
-			}
-			// Execs need to use the actual values, so we must force
-			// their evaluation.
-			varg[i] = Force(varg[i], ae.Type)
-		}
-		// TODO(marius): it might be useful to allow the declarations inside
-		// of an exec to just override the ones outside. This way, we can for
-		// example declare a module-wide image.
-		env2 := values.NewEnv()
-		for _, d := range e.Decls {
-			// These are all guaranteed to be const expressions by the
-			// type checker, so we can safely evaluate them here to an
-			// immediate result.
+		// Before we can emit an exec node, we have to fully evaluate exec
+		// parameters as well as delayed template arguments that are not
+		// file or directory typed. File and template dependencies are pushed
+		// down to the exec node directly.
+		var (
+			tvals                   = make([]interface{}, len(e.Decls))
+			argIndex                = make(map[int]int)
+			hasNonFileDirDelayedDep bool
+			hasFileDirDelayedDep    bool
+			image                   string
+		)
+		for i, d := range e.Decls {
 			v, err := d.Expr.eval(sess, env, d.ID(ident))
 			if err != nil {
 				return nil, err
 			}
-			if !d.Pat.BindValues(env2, v) {
-				return nil, errors.E(fmt.Sprintf("%s:", d.Pat.Position), errMatch)
+			if d.Pat.Ident == "image" {
+				image = v.(string)
+				e.image = v.(string)
 			}
-		}
-		image := env2.Value("image").(string)
-		resources := makeResources(env2)
-
-		// Now for each argument that must be evaluated through the flow
-		// evaluator, we attach as a dependency. Other arguments are inlined.
-		var (
-			deps    []*flow.Flow
-			earg    []flow.ExecArg
-			indexer = newIndexer()
-			argstrs []string
-			b       bytes.Buffer
-		)
-		b.WriteString(quotequote(e.Template.Frags[0]))
-		for i, ae := range e.Template.Args {
-			if ae.Kind == ExprIdent && outputs[ae.Ident] != nil {
-				// An output argument: we replace it with an output exec argument,
-				// indexed by its name.
-				b.WriteString("%s")
-				argstrs = append(argstrs, fmt.Sprintf("{{%s}}", ae.Ident))
-				earg = append(earg, flow.ExecArg{Out: true, Index: indexer.Index(ae.Ident)})
-			} else if f, ok := varg[i].(*flow.Flow); ok {
-				// Runtime dependency: we attach this to our exec nodes, and let
-				// the runtime perform argument substitution. Only files and dirs
-				// are allowed as dynamic dependencies. These are both
-				// represented by reflow.Fileset, and can be substituted by the
-				// runtime. Input arguments are indexed by dependency.
-				//
-				// Because OpExec expects filesets, we have to coerce the input by
-				// type.
-				//
-				// TODO(marius): collapse Vals here
-				f = coerceFlowToFileset(ae.Type, f)
-				b.WriteString("%s")
-				deps = append(deps, f)
-				earg = append(earg, flow.ExecArg{Index: len(deps) - 1})
-				if ae.Kind == ExprIdent {
-					argstrs = append(argstrs, fmt.Sprintf("{{%s}}", ae.Ident))
-				} else {
-					argstrs = append(argstrs, "{{flow}}")
-				}
-			} else {
-				// Immediate argument: we render it and inline it. The typechecker guarantees
-				// that only files, dirs, strings, and ints are allowed here.
-				v := varg[i]
-				switch e.Template.Args[i].Type.Kind {
-				case types.StringKind:
-					b.WriteString(strings.Replace(v.(string), "%", "%%", -1))
-				case types.IntKind:
-					vint := v.(*big.Int)
-					b.WriteString(vint.String())
-				case types.FloatKind:
-					vfloat := v.(*big.Float)
-					b.WriteString(vfloat.String())
-				case types.FileKind, types.DirKind, types.ListKind:
-					// Files and directories must be wrapped back into flows since
-					// this is the only way they can be inlined by reflow's executor
-					// (since it controls paths). Also, input arguments must be
-					// coerced into reflow filesets.
-					b.WriteString("%s")
-					deps = append(deps, &flow.Flow{
-						Op:    flow.Val,
-						Value: coerceToFileset(e.Template.Args[i].Type, v),
-					})
-					earg = append(earg, flow.ExecArg{Index: len(deps) - 1})
-					if ae.Kind == ExprIdent {
-						argstrs = append(argstrs, fmt.Sprintf("{{%s}}", ae.Ident))
-					} else {
-						argstrs = append(argstrs, fmt.Sprintf("{{%s}}", v))
-					}
-				default:
-					panic("illegal expression " + e.Template.Args[i].Type.String() + " ... " + fmt.Sprint(v))
-				}
+			if d.Pat.Ident == "nondeterministic" {
+				e.NonDeterministic = v.(bool)
 			}
-			b.WriteString(quotequote(e.Template.Frags[i+1]))
+			tvals[i] = tval{d.Type, v}
 		}
-		dirs := make([]bool, indexer.N())
-		for name, typ := range outputs {
-			i, ok := indexer.Lookup(name)
-			if !ok {
+		// TODO(marius): abstract into a utility (IsOutput(...))
+		outputs := make(map[string]*types.T)
+		for _, f := range e.Type.Tupled().Fields {
+			outputs[f.Name] = f.T
+		}
+		for i, arg := range e.Template.Args {
+			if arg.Kind == ExprIdent && outputs[arg.Ident] != nil {
 				continue
 			}
-			dirs[i] = typ.Kind == types.DirKind
+			argIndex[len(tvals)] = i
+			v, err := arg.eval(sess, env, ident)
+			if err != nil {
+				return nil, err
+			}
+
+			if _, ok := v.(*flow.Flow); ok && arg.Type.Kind != types.FileKind && arg.Type.Kind != types.DirKind {
+				hasNonFileDirDelayedDep = true
+			}
+			if arg.Type.Kind == types.FileKind || arg.Type.Kind == types.DirKind {
+				hasFileDirDelayedDep = true
+			}
+
+			// We need the full argument to render.
+			v = Force(v, arg.Type)
+			tvals = append(tvals, tval{arg.Type, v})
 		}
-
-		sess.SeeImage(image)
-
-		// The output from an exec is a fileset, so we must coerce it back into a
-		// tuple indexed by the our indexer. We must also coerce filesets into
-		// files and dirs.
-		return &flow.Flow{
-			Ident: ident,
-
-			Deps: []*flow.Flow{{
-				Op:        flow.Exec,
-				Ident:     ident,
-				Position:  e.Position.String(), // XXX TODO full path
-				Image:     image,
-				Resources: resources,
-				// TODO(marius): use a better interpolation scheme that doesn't
-				// require us to do these gymnastics wrt string interpolation.
-				Cmd:         b.String(),
-				Deps:        deps,
-				Argmap:      earg,
-				Argstrs:     argstrs,
-				OutputIsDir: dirs,
-			}},
-
-			Op:         flow.Coerce,
-			FlowDigest: coerceExecOutputDigest,
-			Coerce: func(v values.T) (values.T, error) {
-				list := v.(reflow.Fileset).List
-				if got, want := len(list), indexer.N(); got != want {
-					return nil, fmt.Errorf("bad exec result: expected size %d, got %d (deps %v, argmap %v, outputisdir %v)", want, got, deps, earg, dirs)
+		k, err := e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
+			penv := values.NewEnv()
+			for i, d := range e.Decls {
+				v := vs[i]
+				if !d.Pat.BindValues(penv, v) {
+					return nil, errors.E(fmt.Sprintf("%s:", d.Pat.Position), errMatch)
 				}
-				tup := make(values.Tuple, len(outputs))
-				for i, f := range e.Type.Tupled().Fields {
-					idx, ok := indexer.Lookup(f.Name)
-					if ok {
-						fs := list[idx]
-						var v values.T
-						switch outputs[f.Name].Kind {
-						case types.FileKind:
-							file, ok := fs.Map["."]
-							if !ok {
-								return nil, errors.Errorf("output file not created in %s", ident)
-							}
-							v = file
-						case types.DirKind:
-							dir := make(values.Dir)
-							for k, file := range fs.Map {
-								dir[k] = file
-							}
-							v = dir
-						default:
-							panic("bad result type")
-						}
-						tup[i] = v
-					} else {
-						switch outputs[f.Name].Kind {
-						case types.FileKind:
-							tup[i] = reflow.File{}
-						case types.DirKind:
-							tup[i] = make(values.Dir)
-						default:
-							panic("bad result type")
-						}
-					}
-				}
-				if len(tup) == 1 {
-					return tup[0], nil
-				}
-				return tup, nil
-			},
-		}, nil
+			}
+			args := make(map[int]values.T)
+			for i := len(e.Decls); i < len(vs); i++ {
+				args[argIndex[i]] = vs[i]
+			}
+			return e.exec(sess, env, image, ident, args, makeResources(penv))
+		}, tvals...)
+		kf := k.(*flow.Flow)
+
+		// if this exec has a delayed non-file/non-dir argument AND delayed file/dir argument, it could be susceptible to T41260
+		kf.ExecDepIncorrectCacheKeyBug = hasNonFileDirDelayedDep && hasFileDirDelayedDep
+		return kf, err
 	case ExprCond:
 		return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 			if vs[0].(bool) {
@@ -446,6 +395,8 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 			}
 			return e.Right.eval(sess, env, ident)
 		}, e.Cond)
+	case ExprSwitch:
+		return e.evalSwitch(sess, env, ident)
 	case ExprDeref:
 		return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 			switch e.Left.Type.Kind {
@@ -461,10 +412,10 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 		switch e.Left.Type.Kind {
 		case types.MapKind:
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
-				m, k := vs[0].(values.Map), vs[1]
+				m, k := vs[0].(*values.Map), vs[1]
 				v := m.Lookup(values.Digest(k, e.Left.Type.Index), k)
 				if v == nil {
-					return nil, fmt.Errorf("key %s not found", values.Sprint(vs[1], e.Right.Type))
+					return nil, fmt.Errorf("%v: key %s not found", e.Position, values.Sprint(vs[1], e.Right.Type))
 				}
 				return v, nil
 			}, e.Left, e.Right)
@@ -472,7 +423,7 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 				l, k := vs[0].(values.List), int(vs[1].(*big.Int).Int64())
 				if k < 0 || k >= len(l) {
-					return nil, fmt.Errorf("index %d out of bounds for list of size %v", k, len(l))
+					return nil, fmt.Errorf("%v: index %d out of bounds for list of size %v", e.Position, k, len(l))
 				}
 				return l[k], nil
 			}, e.Left, e.Right)
@@ -493,16 +444,19 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 			if err != nil {
 				return nil, err
 			}
-			for id, m := range d.Pat.Matchers() {
+			for _, m := range d.Pat.Matchers() {
 				w, err := coerceMatch(v, d.Type, d.Pat.Position, m.Path())
 				if err != nil {
 					return nil, err
 				}
+				if m.Ident == "" {
+					continue
+				}
 				if e.Module.Eager() {
-					w = Force(w, params[id].Type)
+					w = Force(w, params[m.Ident].Type)
 				}
 				args = append(args, tval{d.Type, w})
-				argIds = append(argIds, id)
+				argIds = append(argIds, m.Ident)
 			}
 		}
 		if e.Module.Eager() {
@@ -526,35 +480,35 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 			panic("invalid builtin " + e.Op)
 		case "len":
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
-				switch e.Left.Type.Kind {
+				switch e.Fields[0].Expr.Type.Kind {
 				case types.FileKind:
 					file := vs[0].(reflow.File)
 					return values.NewInt(file.Size), nil
 				case types.DirKind:
 					dir := vs[0].(values.Dir)
-					return values.NewInt(int64(len(dir))), nil
+					return values.NewInt(int64(dir.Len())), nil
 				case types.ListKind:
 					list := vs[0].(values.List)
 					return values.NewInt(int64(len(list))), nil
 				case types.MapKind:
-					m := vs[0].(values.Map)
+					m := vs[0].(*values.Map)
 					return values.NewInt(int64(m.Len())), nil
 				default:
 					panic("bug")
 				}
-			}, e.Left)
+			}, e.Fields[0].Expr)
 		case "int":
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 				f := vs[0].(*big.Float)
 				i, _ := f.Int64()
 				return values.NewInt(i), nil
-			}, e.Left)
+			}, e.Fields[0].Expr)
 		case "float":
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 				i := vs[0].(*big.Int)
 				f := float64(i.Int64())
 				return values.NewFloat(f), nil
-			}, e.Left)
+			}, e.Fields[0].Expr)
 		case "zip":
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 				var (
@@ -563,19 +517,19 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 					zip   = make(values.List, len(left))
 				)
 				if len(left) != len(right) {
-					return nil, fmt.Errorf("list sizes do not match: %d vs %d", len(left), len(right))
+					return nil, fmt.Errorf("%v: list sizes do not match: %d vs %d", e.Position, len(left), len(right))
 				}
 				for i := range left {
 					zip[i] = values.Tuple{left[i], right[i]}
 				}
 				return zip, nil
-			}, e.Left, e.Right)
+			}, e.Fields[0].Expr, e.Fields[1].Expr)
 		case "unzip":
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 				list := vs[0].(values.List)
 				tuples := make([]interface{}, len(list))
 				for i, v := range list {
-					tuples[i] = tval{e.Left.Type.Elem, v}
+					tuples[i] = tval{e.Fields[0].Expr.Type.Elem, v}
 				}
 				return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 					var (
@@ -588,68 +542,112 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 					}
 					return values.Tuple{left, right}, nil
 				}, tuples...)
-			}, e.Left)
+			}, e.Fields[0].Expr)
 		case "flatten":
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 				return e.flatten(sess, env, ident, vs[0].(values.List), types.List(e.Type.Elem), stdEvalK)
-			}, e.Left)
+			}, e.Fields[0].Expr)
 		case "map":
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
-				switch e.Left.Type.Kind {
+				switch e.Fields[0].Expr.Type.Kind {
 				case types.ListKind:
 					// We have to unpack both the tuples and the key of the tuples
 					// here.
 					list := vs[0].(values.List)
 					tuples := make([]interface{}, len(list))
 					for i, v := range list {
-						tuples[i] = tval{e.Left.Type.Elem, v}
+						tuples[i] = tval{e.Fields[0].Expr.Type.Elem, v}
 					}
 					return e.k(sess, env, ident, func(tuples []values.T) (values.T, error) {
 						keys := make([]interface{}, len(tuples))
 						for i, v := range tuples {
-							k := tval{e.Left.Type.Elem.Fields[0].T, v.(values.Tuple)[0]}
+							k := tval{e.Fields[0].Expr.Type.Elem.Fields[0].T, v.(values.Tuple)[0]}
 							keys[i] = k
 						}
 						return e.k(sess, env, ident, func(keys []values.T) (values.T, error) {
-							m := make(values.Map)
+							m := new(values.Map)
 							for i, v := range tuples {
-								m.Insert(values.Digest(keys[i], e.Left.Type.Elem.Fields[0].T), keys[i], v.(values.Tuple)[1])
+								m.Insert(values.Digest(keys[i], e.Fields[0].Expr.Type.Elem.Fields[0].T), keys[i], v.(values.Tuple)[1])
 							}
 							return m, nil
 						}, keys...)
 					}, tuples...)
 				case types.DirKind:
-					m := make(values.Map)
+					m := new(values.Map)
 					d := vs[0].(values.Dir)
-					for k, v := range d {
-						m.Insert(values.Digest(k, types.String), k, v)
+					for scan := d.Scan(); scan.Scan(); {
+						m.Insert(values.Digest(scan.Path(), types.String), scan.Path(), scan.File())
 					}
 					return m, nil
 				default:
 					panic("bug")
 				}
-			}, e.Left)
+			}, e.Fields[0].Expr)
+		case "reduce":
+			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
+				fn := vs[0].(values.Func)
+				l := vs[1].(values.List)
+				var v values.T
+				if len(l) == 0 {
+					return nil, fmt.Errorf("%v: cannot reduce empty list", e.Position)
+				}
+				args := make([]values.T, 2)
+				args[0] = l[0]
+				for i := 1; i < len(l); i++ {
+					args[1] = l[i]
+					v, err = fn.Apply(values.Location{Position: e.Position.String()}, args)
+					if err != nil {
+						return nil, err
+					}
+					args[0] = v
+				}
+				return args[0], nil
+			}, e.Fields[0].Expr, e.Fields[1].Expr)
+		case "fold":
+			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
+				fn := vs[0].(values.Func)
+				l := vs[1].(values.List)
+				var v values.T
+				if len(l) == 0 {
+					return vs[2], nil
+				}
+				args := make([]values.T, 2)
+				args[0] = vs[2]
+				for _, li := range l {
+					args[1] = li
+					v, err = fn.Apply(values.Location{Position: e.Position.String()}, args)
+					if err != nil {
+						return nil, err
+					}
+					args[0] = v
+				}
+				return args[0], nil
+			}, e.Fields[0].Expr, e.Fields[1].Expr, e.Fields[2].Expr)
 		case "list":
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 				var list values.List
-				switch e.Left.Type.Kind {
+				switch e.Fields[0].Expr.Type.Kind {
 				case types.MapKind:
-					vs[0].(values.Map).Each(func(k, v values.T) {
+					m := vs[0].(*values.Map)
+					list = make(values.List, 0, m.Len())
+					m.Each(func(k, v values.T) {
 						list = append(list, values.Tuple{k, v})
 					})
 				case types.DirKind:
-					for k, v := range vs[0].(values.Dir) {
-						list = append(list, values.Tuple{k, v})
+					d := vs[0].(values.Dir)
+					list = make(values.List, 0, d.Len())
+					for scan := d.Scan(); scan.Scan(); {
+						list = append(list, values.Tuple{scan.Path(), scan.File()})
 					}
 				default:
 					panic("bug")
 				}
 				return list, nil
-			}, e.Left)
+			}, e.Fields[0].Expr)
 		case "panic":
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
-				return nil, fmt.Errorf("panic: %s", vs[0].(string))
-			}, e.Left)
+				return nil, fmt.Errorf("%v: panic: %s", e.Position, vs[0].(string))
+			}, e.Fields[0].Expr)
 		case "delay":
 			// Delay deliberately introduces delayed evaluation, which is
 			// useful for testing and debugging. It is handled specially in
@@ -657,13 +655,13 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 			// is already resolved.
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 				return vs[0], nil
-			}, e.Left)
+			}, e.Fields[0].Expr)
 		case "trace":
-			left, err := e.Left.eval(sess, env, ident)
+			left, err := e.Fields[0].Expr.eval(sess, env, ident)
 			if err != nil {
 				return nil, err
 			}
-			left = Force(left, e.Left.Type)
+			left = Force(left, e.Fields[0].Expr.Type)
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 				if ident != "" {
 					ident = "(" + ident + ")"
@@ -672,9 +670,9 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 				if stderr == nil {
 					stderr = os.Stderr
 				}
-				fmt.Fprintf(stderr, "%s%s: %s\n", e.Position, ident, values.Sprint(vs[0], e.Left.Type))
+				fmt.Fprintf(stderr, "%s%s: %s\n", e.Position, ident, values.Sprint(vs[0], e.Fields[0].Expr.Type))
 				return vs[0], nil
-			}, tval{e.Left.Type, left})
+			}, tval{e.Fields[0].Expr.Type, left})
 		case "range":
 			return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
 				left, right := vs[0].(*big.Int), vs[1].(*big.Int)
@@ -686,7 +684,7 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 					list = append(list, new(big.Int).Set(i))
 				}
 				return list, nil
-			}, e.Left, e.Right)
+			}, e.Fields[0].Expr, e.Fields[1].Expr)
 		}
 	case ExprRequires:
 		req, err := e.evalRequirements(sess, env, ident)
@@ -709,6 +707,190 @@ func (e *Expr) eval(sess *Session, env *values.Env, ident string) (val values.T,
 		return v, nil
 	}
 	panic("eval bug " + e.String())
+}
+
+// Exec returns a Flow value for an exec expression. The resolved
+// image and resources are passed by the caller.
+func (e *Expr) exec(sess *Session, env *values.Env, image string, ident string, args map[int]values.T, resources reflow.Resources) (values.T, error) {
+	// Execs are special. The interpolation environment also has the
+	// output ids.
+	narg := len(e.Template.Args)
+	outputs := make(map[string]*types.T)
+	for _, f := range e.Type.Tupled().Fields {
+		outputs[f.Name] = f.T
+	}
+	varg := make([]values.T, narg)
+	for i, ae := range e.Template.Args {
+		if ae.Kind == ExprIdent && outputs[ae.Ident] != nil {
+			continue
+		}
+		var ok bool
+		varg[i], ok = args[i]
+		if ok {
+			continue
+		}
+		var err error
+		varg[i], err = ae.eval(sess, env, ident)
+		if err != nil {
+			return nil, err
+		}
+		// This isn't technically required here, but we retain it to keep
+		// digests stable.
+		varg[i] = Force(varg[i], ae.Type)
+	}
+
+	// Now for each argument that must be evaluated through the flow
+	// evaluator, we attach as a dependency. Other arguments are inlined.
+	var (
+		deps    []*flow.Flow
+		earg    []flow.ExecArg
+		indexer = newIndexer()
+		argstrs []string
+		b       bytes.Buffer
+	)
+	b.WriteString(quotequote(e.Template.Frags[0]))
+	for i, ae := range e.Template.Args {
+		if ae.Kind == ExprIdent && outputs[ae.Ident] != nil {
+			// An output argument: we replace it with an output exec argument,
+			// indexed by its name.
+			b.WriteString("%s")
+			argstrs = append(argstrs, fmt.Sprintf("{{%s}}", ae.Ident))
+			earg = append(earg, flow.ExecArg{Out: true, Index: indexer.Index(ae.Ident)})
+		} else if f, ok := varg[i].(*flow.Flow); ok {
+			// Runtime dependency: we attach this to our exec nodes, and let
+			// the runtime perform argument substitution. Only files and dirs
+			// are allowed as dynamic dependencies. These are both
+			// represented by reflow.Fileset, and can be substituted by the
+			// runtime. Input arguments are indexed by dependency.
+			//
+			// Because OpExec expects filesets, we have to coerce the input by
+			// type.
+			//
+			// TODO(marius): collapse Vals here
+			f = coerceFlowToFileset(ae.Type, f)
+			b.WriteString("%s")
+			deps = append(deps, f)
+			earg = append(earg, flow.ExecArg{Index: len(deps) - 1})
+			if ae.Kind == ExprIdent {
+				argstrs = append(argstrs, fmt.Sprintf("{{%s}}", ae.Ident))
+			} else {
+				argstrs = append(argstrs, "{{flow}}")
+			}
+		} else {
+			// Immediate argument: we render it and inline it. The typechecker guarantees
+			// that only files, dirs, strings, and ints are allowed here.
+			v := varg[i]
+			switch e.Template.Args[i].Type.Kind {
+			case types.StringKind:
+				b.WriteString(strings.Replace(v.(string), "%", "%%", -1))
+			case types.IntKind:
+				vint := v.(*big.Int)
+				b.WriteString(vint.String())
+			case types.FloatKind:
+				vfloat := v.(*big.Float)
+				b.WriteString(vfloat.String())
+			case types.FileKind, types.DirKind, types.ListKind:
+				// Files and directories must be wrapped back into flows since
+				// this is the only way they can be inlined by reflow's executor
+				// (since it controls paths). Also, input arguments must be
+				// coerced into reflow filesets.
+				b.WriteString("%s")
+				deps = append(deps, &flow.Flow{
+					Op:    flow.Val,
+					Value: coerceToFileset(e.Template.Args[i].Type, v),
+				})
+				earg = append(earg, flow.ExecArg{Index: len(deps) - 1})
+				if ae.Kind == ExprIdent {
+					argstrs = append(argstrs, fmt.Sprintf("{{%s}}", ae.Ident))
+				} else {
+					argstrs = append(argstrs, fmt.Sprintf("{{%s}}", v))
+				}
+			default:
+				panic("illegal expression " + e.Template.Args[i].Type.String() + " ... " + fmt.Sprint(v))
+			}
+		}
+		b.WriteString(quotequote(e.Template.Frags[i+1]))
+	}
+	dirs := make([]bool, indexer.N())
+	for name, typ := range outputs {
+		i, ok := indexer.Lookup(name)
+		if !ok {
+			continue
+		}
+		dirs[i] = typ.Kind == types.DirKind
+	}
+
+	sess.SeeImage(image)
+
+	// The output from an exec is a fileset, so we must coerce it back into a
+	// tuple indexed by the our indexer. We must also coerce filesets into
+	// files and dirs.
+	return &flow.Flow{
+		Ident: ident,
+
+		Deps: []*flow.Flow{{
+			Op:        flow.Exec,
+			Ident:     ident,
+			Position:  e.Position.String(), // XXX TODO full path
+			Image:     image,
+			Resources: resources,
+			// TODO(marius): use a better interpolation scheme that doesn't
+			// require us to do these gymnastics wrt string interpolation.
+			Cmd:              b.String(),
+			Deps:             deps,
+			Argmap:           earg,
+			Argstrs:          argstrs,
+			OutputIsDir:      dirs,
+			NonDeterministic: e.NonDeterministic,
+		}},
+
+		Op:         flow.Coerce,
+		FlowDigest: coerceExecOutputDigest,
+		Coerce: func(v values.T) (values.T, error) {
+			list := v.(reflow.Fileset).List
+			if got, want := len(list), indexer.N(); got != want {
+				return nil, fmt.Errorf("%v: bad exec result: expected size %d, got %d (deps %v, argmap %v, outputisdir %v)", e.Position, want, got, deps, earg, dirs)
+			}
+			tup := make(values.Tuple, len(outputs))
+			for i, f := range e.Type.Tupled().Fields {
+				idx, ok := indexer.Lookup(f.Name)
+				if ok {
+					fs := list[idx]
+					var v values.T
+					switch outputs[f.Name].Kind {
+					case types.FileKind:
+						file, ok := fs.Map["."]
+						if !ok {
+							return nil, errors.Errorf("output file not created in %s", ident)
+						}
+						v = file
+					case types.DirKind:
+						var dir values.Dir
+						for k, file := range fs.Map {
+							dir.Set(k, file)
+						}
+						v = dir
+					default:
+						panic("bad result type")
+					}
+					tup[i] = v
+				} else {
+					switch outputs[f.Name].Kind {
+					case types.FileKind:
+						tup[i] = reflow.File{}
+					case types.DirKind:
+						tup[i] = values.Dir{}
+					default:
+						panic("bad result type")
+					}
+				}
+			}
+			if len(tup) == 1 {
+				return tup[0], nil
+			}
+			return tup, nil
+		},
+	}, nil
 }
 
 func not(v values.T) (values.T, error) {
@@ -738,7 +920,7 @@ func (e *Expr) evalRequirements(sess *Session, env *values.Env, ident string) (r
 	}
 	req.Min = makeResources(env2)
 	if v := env2.Value("wide"); v != nil && v.(bool) {
-		// TODO(marius): allow the user to pass down the desired width
+		log.Printf("WARNING: setting `wide := true` has no real effect: %s %s", e.Position, e.Ident)
 		req.Width = 1
 	}
 	return req, nil
@@ -851,6 +1033,10 @@ func (e *Expr) evalEqTuple(sess *Session, env *values.Env, ident string, l, r va
 
 func (e *Expr) evalEq(sess *Session, env *values.Env, ident string, left, right values.T, t *types.T) (values.T, error) {
 	switch t.Kind {
+	case types.FileKind:
+		l := left.(reflow.File)
+		r := right.(reflow.File)
+		return l.Equal(r), nil
 	case types.ListKind:
 		l := left.(values.List)
 		r := right.(values.List)
@@ -864,17 +1050,17 @@ func (e *Expr) evalEq(sess *Session, env *values.Env, ident string, left, right 
 	case types.TupleKind:
 		l := left.(values.Tuple)
 		r := right.(values.Tuple)
-		if len(l) == 0 {
+		if len(t.Fields) == 0 {
 			return true, nil
 		}
 		return e.evalEqTuple(sess, env, ident, l, r, t)
 	case types.MapKind:
-		l := left.(values.Map)
-		r := right.(values.Map)
-		if len(l) != len(r) {
+		l := left.(*values.Map)
+		r := right.(*values.Map)
+		if l.Len() != r.Len() {
 			return false, nil
 		}
-		n := len(l)
+		n := l.Len()
 		keys := make([]values.T, n*2)
 		vals := make([]values.T, n*2)
 		i := 0
@@ -903,17 +1089,36 @@ func (e *Expr) evalEq(sess *Session, env *values.Env, ident string, left, right 
 			return e.evalValueVector(sess, env, ident, vals[0:n], right, tv, 0)
 		})
 	case types.StructKind:
-		l := left.(values.Struct)
-		r := right.(values.Struct)
-		n := len(l)
-		lt := make(values.Tuple, n)
-		rt := make(values.Tuple, n)
+		var (
+			leftStruct  = left.(values.Struct)
+			rightStruct = right.(values.Struct)
+			n           = len(t.Fields)
+			leftTup     = make(values.Tuple, n)
+			rightTup    = make(values.Tuple, n)
+			tupType     = types.Tuple(t.Fields...)
+		)
 		for i, f := range t.Fields {
-			lt[i] = l[f.Name]
-			rt[i] = r[f.Name]
+			leftTup[i] = leftStruct[f.Name]
+			rightTup[i] = rightStruct[f.Name]
 		}
-		tt := types.Tuple(t.Fields...)
-		return e.evalEqTuple(sess, env, ident, lt, rt, tt)
+		return e.evalEqTuple(sess, env, ident, leftTup, rightTup, tupType)
+	case types.SumKind:
+		leftVariant := left.(*values.Variant)
+		rightVariant := right.(*values.Variant)
+		if leftVariant.Tag != rightVariant.Tag {
+			return false, nil
+		}
+		elemTyp := t.VariantMap()[leftVariant.Tag]
+		if elemTyp == nil {
+			return true, nil
+		}
+		return e.k(sess, env, ident, func(vs []values.T) (values.T, error) {
+			return e.evalEq(sess, env, ident, vs[0], vs[1], elemTyp)
+		}, tval{elemTyp, leftVariant.Elem}, tval{elemTyp, rightVariant.Elem})
+	case types.DirKind:
+		l := left.(values.Dir)
+		r := right.(values.Dir)
+		return l.Equal(r), nil
 	default:
 		return values.Equal(left, right), nil
 	}
@@ -948,14 +1153,23 @@ func (e *Expr) evalBinop(vs []values.T) (values.T, error) {
 			)
 			return values.List(append(append(make(values.List, 0, len(left)+len(right)), left...), right...)), nil
 		case types.MapKind:
-			m := make(values.Map)
-			left.(values.Map).Each(func(k, v values.T) {
+			m := new(values.Map)
+			left.(*values.Map).Each(func(k, v values.T) {
 				m.Insert(values.Digest(k, e.Left.Type.Index), k, v)
 			})
-			right.(values.Map).Each(func(k, v values.T) {
+			right.(*values.Map).Each(func(k, v values.T) {
 				m.Insert(values.Digest(k, e.Right.Type.Index), k, v)
 			})
 			return m, nil
+		case types.DirKind:
+			var dir values.Dir
+			for scan := left.(values.Dir).Scan(); scan.Scan(); {
+				dir.Set(scan.Path(), scan.File())
+			}
+			for scan := right.(values.Dir).Scan(); scan.Scan(); {
+				dir.Set(scan.Path(), scan.File())
+			}
+			return dir, nil
 		default:
 			panic("bug")
 		}
@@ -1090,12 +1304,14 @@ func (e *Expr) evalCompr(sess *Session, env *values.Env, ident string, begin int
 				list = make(values.List, len(left))
 				for i, v := range left {
 					env2 := env.Push()
-					for id, m := range clause.Pat.Matchers() {
+					for _, m := range clause.Pat.Matchers() {
 						w, err := coerceMatch(v, clause.Expr.Type.Elem, clause.Pat.Position, m.Path())
 						if err != nil {
 							return nil, err
 						}
-						env2.Bind(id, w)
+						if m.Ident != "" {
+							env2.Bind(m.Ident, w)
+						}
 					}
 					var err error
 					if last {
@@ -1108,11 +1324,11 @@ func (e *Expr) evalCompr(sess *Session, env *values.Env, ident string, begin int
 					}
 				}
 			case types.MapKind:
-				left := vs[0].(values.Map)
+				left := vs[0].(*values.Map)
 				var err error
 				left.Each(func(k, v values.T) {
 					env2 := env.Push()
-					for id, matcher := range clause.Pat.Matchers() {
+					for _, matcher := range clause.Pat.Matchers() {
 						tup := values.Tuple{k, v}
 						var w values.T
 						w, err = coerceMatch(
@@ -1127,7 +1343,9 @@ func (e *Expr) evalCompr(sess *Session, env *values.Env, ident string, begin int
 						if err != nil {
 							return
 						}
-						env2.Bind(id, w)
+						if matcher.Ident != "" {
+							env2.Bind(matcher.Ident, w)
+						}
 					}
 					var ev values.T
 					if last {
@@ -1288,8 +1506,8 @@ func (k evalK) Continue(e *Expr, sess *Session, env *values.Env, ident string, k
 	// Otherwise, the node cannot be immediately evaluated; we defer its
 	// evaluation until all of its dependencies are resolved.
 	//
-	//We first compute the (single-node) digest to identify  the
-	//operation.
+	// We first compute the (single-node) digest to identify the
+	// operation.
 	//
 	// Note that, except for operations that delay evaluating part of
 	// the tree, all dependencies are captured either directly through
@@ -1357,7 +1575,6 @@ var stdEvalK evalK = func(e *Expr, env *values.Env, dw io.Writer) {
 		}
 		e.Left.digest(dw, env2)
 	}
-
 }
 
 // makeResources constructs a resource specification

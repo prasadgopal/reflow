@@ -16,14 +16,17 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime"
 	"runtime/pprof"
 	"sort"
 	"syscall"
 
 	"github.com/grailbio/base/status"
-	"github.com/grailbio/reflow/config"
+	"github.com/grailbio/infra"
 	"github.com/grailbio/reflow/flow"
+	infra2 "github.com/grailbio/reflow/infra"
 	"github.com/grailbio/reflow/log"
+	"gopkg.in/yaml.v2"
 )
 
 // Func is the type of a command function.
@@ -32,8 +35,12 @@ type Func func(*Cmd, context.Context, ...string)
 // Cmd holds the configuration, flag definitions, and runtime objects
 // required for tool invocations.
 type Cmd struct {
+	// Schema is the infrastructure schema.
+	Schema infra.Schema
+	// SchemaKeys is the schema keys to providers,flags.
+	SchemaKeys infra.Keys
 	// Config must be specified.
-	Config            config.Config
+	Config            infra.Config
 	DefaultConfigFile string
 	Version           string
 	Variant           string
@@ -41,13 +48,8 @@ type Cmd struct {
 	// Commands contains the additional set of invocable commands.
 	Commands map[string]Func
 
-	// MakeConfig is called to wrap the base configuration.
-	// This allows a tool instance to customize on top of the
-	// base configuration.
-	MakeConfig func(config.Config) config.Config
-
 	// ConfigFile stores the path of the active configuration file.
-	// May be overriden by the -config flag.
+	// May be overridden by the -config flag.
 	ConfigFile string
 
 	// Intro is an additional introduction printed after the standard one.
@@ -62,14 +64,13 @@ type Cmd struct {
 	// progress of the cmd execution.
 	Status *status.Status
 
-	// ValidateConfig is run on the configuration to validate its state.
-	// Configuration validation errors are fatal.
-	// ValidateConfig is not run for command "migrate"
-	ValidateConfig func(config.Config) error
+	// BootstrapBinary stores the path of the bootstrap binary.
+	BootstrapBinary string
 
 	configFlags    map[string]*string
 	httpFlag       string
 	cpuProfileFlag string
+	memProfileFlag string
 	logFlag        string
 
 	onexits []func()
@@ -85,27 +86,33 @@ var commands = map[string]Func{
 	"version":      (*Cmd).versionCmd,
 	"run":          (*Cmd).run,
 	"bundle":       (*Cmd).bundle,
+	"check":        (*Cmd).check,
 	"doc":          (*Cmd).doc,
 	"info":         (*Cmd).info,
 	"cat":          (*Cmd).cat,
 	"sync":         (*Cmd).sync,
 	"kill":         (*Cmd).kill,
-	"offers":       (*Cmd).offers,
 	"logs":         (*Cmd).logs,
 	"batchrun":     (*Cmd).batchrun,
 	"runbatch":     (*Cmd).runbatch,
+	"genbatch":     (*Cmd).genbatch,
 	"batchinfo":    (*Cmd).batchinfo,
 	"listbatch":    (*Cmd).listbatch,
 	"ec2instances": (*Cmd).ec2instances,
 	"config":       (*Cmd).config,
 	"images":       (*Cmd).images,
 	"rmcache":      (*Cmd).rmcache,
+	"serve":        (*Cmd).serveCmd,
 	"shell":        (*Cmd).shell,
+	"test":         (*Cmd).test,
 	"repair":       (*Cmd).repair,
 	"collect":      (*Cmd).collect,
+	"http":         (*Cmd).http,
+	"upgrade":      (*Cmd).upgrade,
+	"ec2verify":    (*Cmd).ec2verify,
 }
 
-var intro = `The reflow command helps users run Reflow programs, inspect their
+var intro = `The reflow command helps users run Reflow programs, ExecInspect their
 outputs, and query their statuses.
 
 The command comprises a set of subcommands; the list of supported
@@ -125,7 +132,7 @@ supplied in order: global flags after the "reflow" command; command
 flags after that command's name. For example, the following turns
 caching off (global) while running a reflow program in local mode:
 
-	reflow run -cache=false -local align.rf
+	reflow -cache=off run -local align.rf
 
 Reflow is configured from a single configuration file. A default
 configuration is built in and may be examined by
@@ -141,9 +148,9 @@ Reflow's configuration is documented by the config command:
 
 	reflow config -help
 
-Reflow's toplevel configuration keys may be overriden by flags. These
+Reflow's toplevel configuration keys may be overridden by flags. These
 are: -logger, -aws, -awscreds, -awstool, -user, -https, -cache, and
--cluster. They take the same values as the configuration file: see 
+-cluster. They take the same values as the configuration file: see
 reflow config -help for details.`
 
 var help = `Reflow is a tool for managing execution of Reflow programs.
@@ -173,7 +180,7 @@ func (c *Cmd) usage(flags *flag.FlagSet) {
 
 // Main parses command line flags and then invokes the requested
 // command. Main uses Cmd's config (and other initialization), which
-// may be overriden by flag configs. It should be invoked only once,
+// may be overridden by flag configs. It should be invoked only once,
 // at the beginning of command line execution.
 // The caller is expected to have parsed the flagset for us before
 // calling Main.
@@ -221,6 +228,7 @@ func (c *Cmd) Main() {
 		logflags = golog.LstdFlags
 		logprefix = ""
 	}
+
 	c.Status = new(status.Status)
 	http.Handle("/debug/status", status.Handler(c.Status))
 	if level < log.DebugLevel {
@@ -237,40 +245,42 @@ func (c *Cmd) Main() {
 	c.Log = log.Std
 
 	// Define logs as configured by flags.
-	c.Config = &logConfig{c.Config, c.Log}
-
 	if c.ConfigFile != "" {
 		b, err := ioutil.ReadFile(c.ConfigFile)
 		if err != nil && c.ConfigFile != c.DefaultConfigFile {
 			c.Fatal(err)
 		}
-		if err := config.Unmarshal(b, c.Config.Keys()); err != nil {
-			c.Fatal(err)
+		keys := make(infra.Keys)
+		if err := yaml.Unmarshal(b, keys); err != nil {
+			c.Fatalf("config %v: %v", c.ConfigFile, err)
+		}
+		for k, v := range keys {
+			c.SchemaKeys[k] = v
 		}
 	}
 	for k, v := range c.configFlags {
 		if *v == "" {
 			continue
 		}
-		c.Config.Keys()[k] = *v
+		c.SchemaKeys[k] = *v
 	}
+	c.SchemaKeys["logger"] = fmt.Sprintf("logger,level=%v", c.logFlag)
+	// Set the reflow version to always match the version of the binary, regardless of the provided configuration.
+	c.SchemaKeys[infra2.Reflow] = fmt.Sprintf("reflowversion,version=%s", c.Version)
 	var err error
-	c.Config, err = config.Make(c.Config)
-	if err != nil {
-		c.Fatal(err)
-	}
-	// Run MakeConfig last, so that they can be properly composed with
-	// underlying config overrides.
-	if c.MakeConfig != nil {
-		// The whole business of wrapping configuration is getting
-		// ugly. We should rethink this configuration system a little.
-		c.Config = c.MakeConfig(c.Config)
-	}
-	c.Config = config.Once(c.Config)
-	if c.ValidateConfig != nil && cmd != "migrate" {
-		if err := c.ValidateConfig(c.Config); err != nil {
-			c.Fatalf(`invalid configuration: %v: please run "reflow migrate"`, err)
-		}
+	c.Config, err = c.Schema.Make(c.SchemaKeys)
+	c.must(err)
+
+	var (
+		bootstrapimage *infra2.BootstrapImage
+		dockerconfig   *infra2.DockerConfig
+	)
+	c.must(c.Config.Instance(&bootstrapimage))
+	c.must(c.Config.Instance(&dockerconfig))
+
+	// Set the bootstrap image to the official image for this distribution
+	if ok := bootstrapimage.Set(c.BootstrapBinary); !ok {
+		c.Log.Printf("using bootstrap image from config %s (instead of built-in one: %s)\n", bootstrapimage.Value(), c.BootstrapBinary)
 	}
 
 	if c.httpFlag != "" {
@@ -280,11 +290,23 @@ func (c *Cmd) Main() {
 	}
 	if c.cpuProfileFlag != "" {
 		file, err := os.Create(c.cpuProfileFlag)
-		if err != nil {
-			c.Fatal(err)
-		}
+		c.must(err)
 		pprof.StartCPUProfile(file)
-		c.onexit(pprof.StopCPUProfile)
+		c.onexit(func() {
+			pprof.StopCPUProfile()
+			_ = file.Close()
+		})
+	}
+	if c.memProfileFlag != "" {
+		file, err := os.Create(c.memProfileFlag)
+		c.must(err)
+		c.onexit(func() {
+			runtime.GC() // get up-to-date statistics
+			if err := pprof.WriteHeapProfile(file); err != nil {
+				c.Errorf("WriteHeapProfile: %v", err)
+			}
+			_ = file.Close()
+		})
 	}
 
 	if err := increaseFDRlimit(); err != nil {
@@ -292,7 +314,7 @@ func (c *Cmd) Main() {
 	}
 
 	c.Log.Debug("reflow version ", c.version())
-	c.Log.Debug("reflowlet image ", c.Config.Value("reflowlet").(string))
+	c.Log.Debug("bootstrap binary: ", bootstrapimage.Value())
 
 	// Create a context and cancel it if we receive an interrupt.
 	// The second interrupt we receive results in a hard exit.
@@ -306,11 +328,28 @@ func (c *Cmd) Main() {
 		<-sigc
 		c.Exit(1)
 	}()
-	// Note that the flag package stops parsing flags after the first
-	// non-flag argument (i.e., the first argument that does not begin
-	// with "-"); thus flag.Args()[1:] contains all the flags and
-	// arguments for the command in flags.Arg[0].
-	fn(c, ctx, flags.Args()[1:]...)
+
+	// If the command panics, we want to recover, log and exit normally.
+	var perr error
+	func() {
+		defer func() {
+			v := recover()
+			if v == nil {
+				return
+			}
+			if err, ok := v.(error); ok {
+				perr = err
+			} else {
+				perr = fmt.Errorf("panic: %v", v)
+			}
+		}()
+		// Note that the flag package stops parsing flags after the first
+		// non-flag argument (ExecInspect.e., the first argument that does not begin
+		// with "-"); thus flag.Args()[1:] contains all the flags and
+		// arguments for the command in flags.Arg[0].
+		fn(c, ctx, flags.Args()[1:]...)
+	}()
+	c.must(perr)
 	c.Exit(0)
 }
 
@@ -374,12 +413,12 @@ func (c *Cmd) Flags() *flag.FlagSet {
 		c.flags.StringVar(&c.ConfigFile, "config", c.DefaultConfigFile, "path to configuration file; otherwise use default (builtin) config")
 		c.flags.StringVar(&c.httpFlag, "http", "", "run a diagnostic HTTP server on this port")
 		c.flags.StringVar(&c.cpuProfileFlag, "cpuprofile", "", "capture a CPU profile and deposit it to the provided path")
+		c.flags.StringVar(&c.memProfileFlag, "memprofile", "", "capture a Memory profile and deposit it to the provided path")
 		c.flags.StringVar(&c.logFlag, "log", "info", "set the log level: off, error, info, debug")
 		// Add flags to override configuration.
 		c.configFlags = make(map[string]*string)
-		for _, key := range config.AllKeys {
-			c.configFlags[key] = c.flags.String(key, "",
-				fmt.Sprintf("override %s from config; see reflow config -help", key))
+		for key := range c.SchemaKeys {
+			c.configFlags[key] = c.flags.String(key, "", fmt.Sprintf("override %s from config; see reflow config -help", key))
 		}
 	}
 	return c.flags
@@ -411,14 +450,14 @@ func increaseFDRlimit() error {
 		return nil
 	}
 	l.Cur = l.Max
+
+	// The following is a workaround for this issue:
+	// https://github.com/golang/go/issues/30401
+	if runtime.GOOS == "darwin" && l.Cur > 24576 {
+		// The max file limit is 24576, even though the max returned by
+		// Getrlimit is 1<<63-1.
+		l.Cur = 24576
+	}
+
 	return syscall.Setrlimit(syscall.RLIMIT_NOFILE, &l)
-}
-
-type logConfig struct {
-	config.Config
-	logger *log.Logger
-}
-
-func (c *logConfig) Logger() (*log.Logger, error) {
-	return c.logger, nil
 }

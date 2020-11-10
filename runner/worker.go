@@ -6,6 +6,7 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/grailbio/base/data"
@@ -13,6 +14,8 @@ import (
 	"github.com/grailbio/reflow/errors"
 	"github.com/grailbio/reflow/flow"
 	"github.com/grailbio/reflow/log"
+	"github.com/grailbio/reflow/taskdb"
+	"github.com/grailbio/reflow/trace"
 )
 
 const (
@@ -71,7 +74,7 @@ func (w *worker) Go(ctx context.Context) {
 			}
 			w.Log.Debugf("stole %v", f)
 			available.Sub(available, f.Resources)
-			w.Eval.Mutate(f, flow.Running)
+			w.Eval.Mutate(f, flow.Execing)
 			npending++
 			go func(f *flow.Flow) {
 				if err := w.do(ctx, f); err != nil {
@@ -142,6 +145,19 @@ func (w *worker) do(ctx context.Context, f *flow.Flow) (err error) {
 			w.Log.Debug(f.ExecString(false))
 		}
 	}()
+	var name string
+	switch f.Op {
+	case flow.Extern:
+		name = fmt.Sprintf("extern %s %s", f.URL, data.Size(f.Deps[0].Value.(reflow.Fileset).Size()))
+	case flow.Intern:
+		name = fmt.Sprintf("intern %s", f.URL)
+	case flow.Exec:
+		name = fmt.Sprintf("exec %s", f.AbbrevCmd())
+	}
+	ctx, done := trace.Start(ctx, trace.Exec, f.Digest(), name)
+	trace.Note(ctx, "ident", f.Ident)
+
+	defer done()
 
 	type state int
 	const (
@@ -155,15 +171,42 @@ func (w *worker) do(ctx context.Context, f *flow.Flow) (err error) {
 		stateDone
 	)
 	var (
-		x reflow.Exec
-		r reflow.Result
-		n = 0
-		s = stateUpload
+		x       reflow.Exec
+		r       reflow.Result
+		n       = 0
+		s       = stateUpload
+		cfg     = f.ExecConfig()
+		tctx    context.Context
+		tcancel context.CancelFunc
 	)
+	defer func() {
+		if tcancel == nil {
+			return
+		}
+		terr := err
+		if err == nil {
+			terr = r.Err
+		}
+		tdbErr := w.Eval.TaskDB.SetTaskComplete(context.Background(), f.TaskID, terr, time.Now())
+		if tdbErr != nil {
+			w.Log.Debugf("taskdb settaskcomplete: %v\n", tdbErr)
+		}
+		tcancel()
+	}()
 	for n < numTries && s < stateDone {
 		switch s {
 		case stateUpload:
 			begin := time.Now()
+			if w.Eval.TaskDB != nil && tctx == nil {
+				// disable govet check due to https://github.com/golang/go/issues/29587
+				tctx, tcancel = context.WithCancel(ctx) //nolint: govet
+				err = w.Eval.TaskDB.CreateTask(tctx, f.TaskID, w.Eval.RunID, f.Digest(), taskdb.NewImgCmdID(cfg.Image, cfg.Cmd), cfg.Ident, "")
+				if err != nil {
+					w.Log.Debugf("taskdb createtask: %v\n", err)
+				} else {
+					go func() { _ = taskdb.KeepTaskAlive(tctx, w.Eval.TaskDB, f.TaskID) }()
+				}
+			}
 			w.Log.Debugf("transferring %s (%d files) to worker repository for flow %v", size, len(files), f)
 			err = w.Eval.Transferer.Transfer(ctx, w.Executor.Repository(), w.Eval.Executor.Repository(), files...)
 			if err == nil {
@@ -172,27 +215,30 @@ func (w *worker) do(ctx context.Context, f *flow.Flow) (err error) {
 				w.Log.Errorf("transfer error: %v", err)
 			}
 		case statePut:
-			x, err = w.Executor.Put(ctx, f.Digest(), reflow.ExecConfig{
-				Type:        "exec",
-				Ident:       f.Ident,
-				Image:       f.Image,
-				Cmd:         f.Cmd,
-				Args:        args,
-				Resources:   f.Resources,
-				OutputIsDir: f.OutputIsDir,
-			})
+			x, err = w.Executor.Put(ctx, f.ExecId, cfg)
 			if err == nil {
+				if w.Eval.TaskDB != nil {
+					if taskdbErr := w.Eval.TaskDB.SetTaskUri(tctx, f.TaskID, x.URI()); taskdbErr != nil {
+						w.Log.Errorf("taskdb settaskuri: %v", taskdbErr)
+					}
+				}
 				f.Exec = x
 				w.Eval.LogFlow(ctx, f)
 			}
 		case stateWait:
 			err = x.Wait(ctx)
+			if w.Eval.TaskDB != nil {
+				err = w.Eval.TaskDB.SetTaskResult(tctx, f.TaskID, x.ID())
+				if err != nil {
+					w.Log.Debugf("taskdb settaskresult: %v\n", err)
+				}
+			}
 		case stateInspect:
 			f.Inspect, err = x.Inspect(ctx)
 		case stateResult:
 			r, err = x.Result(ctx)
 			if err == nil {
-				w.Eval.Mutate(f, r.Fileset, flow.Incr)
+				w.Eval.Mutate(f, r.Fileset, flow.Incr, flow.Propagate)
 			}
 		case statePromote:
 			// TODO(marius): make the exec's staging repository directly

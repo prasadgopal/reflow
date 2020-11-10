@@ -14,6 +14,7 @@ import (
 	"io/ioutil"
 	golog "log"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/grailbio/base/data"
 	"github.com/grailbio/base/digest"
+	"github.com/grailbio/base/sync/once"
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/blob"
 	"github.com/grailbio/reflow/errors"
@@ -31,11 +33,63 @@ import (
 )
 
 var (
-	waitingFiles     = expvar.NewInt("blobwaiting")
 	fetchingFiles    = expvar.NewInt("blobfetching")
 	downloadingFiles = expvar.NewInt("blobdownloading")
 	digestingFiles   = expvar.NewInt("blobdigesting")
+	uploadingFiles   = expvar.NewInt("blobuploading")
+	internRate       = expvar.NewInt("blobinternrate")
+	externRate       = expvar.NewInt("blobexternrate")
 )
+
+// rateExporter measures progress in bytes and updates exported var.
+// It does so by keeping track of total bytes
+type rateExporter struct {
+	begin time.Time
+	exp   *expvar.Int
+
+	mu       sync.Mutex
+	bytes    int64
+	prevRate int64
+	done     bool
+}
+
+// newRateExporter returns a new rateExporter which updates the given exporter var.
+func newRateExporter(expvar *expvar.Int) *rateExporter {
+	return &rateExporter{begin: time.Now(), exp: expvar}
+}
+
+// rate returns the current rate defined as the ratio of
+// total bytes by the time since the beginning.
+func (b *rateExporter) rate() int64 {
+	dur := time.Since(b.begin)
+	dur -= dur % time.Second
+	if dur < time.Second {
+		dur = time.Second
+	}
+	return b.bytes / int64(dur.Seconds())
+}
+
+// Add adds the given bytes to the rateExporter and causes a recomputation of the rate.
+// Then the difference between the current rate and the previous rate is added to the exported var.
+func (b *rateExporter) Add(bytes int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.done {
+		return
+	}
+	b.bytes += bytes
+	rate := b.rate()
+	b.exp.Add(rate - b.prevRate)
+	b.prevRate = rate
+}
+
+// Done signals that this rateExporter is done and will no longer update the exporter var.
+func (b *rateExporter) Done() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.done = true
+	b.exp.Add(-b.prevRate)
+}
 
 // a canceler rendezvous a cancellation function with a
 // cancellation request.
@@ -107,9 +161,10 @@ type blobExec struct {
 	// ExecURI is returned by URI.
 	ExecURI string
 
-	// downloadedSize stores the total amount of downloaded and installed
-	// data.
-	downloadedSize uint64
+	// transferType stores the type of transfer (ie "intern" or "extern")
+	transferType string
+	// transferredSize stores the total amount of data either downloaded and installed or uploaded.
+	transferredSize uint64
 
 	canceler canceler
 
@@ -125,6 +180,25 @@ type blobExec struct {
 	// restarts; they can also be restored as zombies.
 	Manifest
 	err error
+
+	x           *Executor
+	promoteOnce once.Task
+}
+
+const (
+	intern = "intern"
+	extern = "extern"
+)
+
+// transferTypeStr returns a human-readable string for the transfer type.
+func (e *blobExec) transferTypeStr() string {
+	switch e.transferType {
+	case intern:
+		return "download"
+	case extern:
+		return "upload"
+	}
+	return "unknown"
 }
 
 // Init initializes an blobExec from (optionally) an executor.
@@ -134,9 +208,10 @@ func (e *blobExec) Init(x *Executor) {
 		e.Root = x.execPath(e.ID())
 		e.Repository = x.FileRepository
 		e.ExecURI = x.URI() + "/" + e.ID().Hex()
-		e.staging.Root = x.execPath(e.ID(), objectsDir)
-		e.staging.Log = x.Log
-
+		if e.transferType == intern {
+			e.staging.Root = x.execPath(e.ID(), objectsDir)
+			e.staging.Log = x.Log
+		}
 	}
 	e.Manifest.Created = time.Now()
 	e.Manifest.Type = execBlob
@@ -174,7 +249,11 @@ func (e *blobExec) Go(ctx context.Context) {
 		case execCreated:
 			state = execRunning
 		case execRunning:
-			err = e.do(ctx)
+			if e.transferType == intern {
+				err = e.doIntern(ctx)
+			} else {
+				err = e.doExtern(ctx)
+			}
 			if err == nil {
 				state = execComplete
 				break
@@ -184,7 +263,7 @@ func (e *blobExec) Go(ctx context.Context) {
 				break
 			}
 			state = execComplete
-			e.Manifest.Result.Err = errors.Recover(errors.E("intern", fmt.Sprint(e.Config.URL), err))
+			e.Manifest.Result.Err = errors.Recover(errors.E(e.transferType, fmt.Sprint(e.Config.URL), err))
 			err = nil
 		default:
 			panic("bug")
@@ -236,13 +315,13 @@ func (e *blobExec) init(ctx context.Context) (execState, error) {
 	return execCreated, nil
 }
 
-func (e *blobExec) do(ctx context.Context) error {
+func (e *blobExec) doIntern(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	e.canceler.Set(cancel)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if e.Config.Type != "intern" {
+	if e.Config.Type != intern {
 		return errors.E("exec", e.ID(), errors.NotSupported, errors.Errorf("unsupported exec type %v", e.Config.Type))
 	}
 	bucket, prefix, err := e.Blob.Bucket(ctx, e.Config.URL)
@@ -251,8 +330,6 @@ func (e *blobExec) do(ctx context.Context) error {
 	}
 
 	// Define the error group under which we will perform all of our fetches.
-	// We thread the common context through an http round tripper that will
-	// terminate all pending requests when that context is cancelled.
 	g, ctx := errgroup.WithContext(ctx)
 
 	e.mu.Lock()
@@ -265,23 +342,28 @@ func (e *blobExec) do(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		dl := download{
-			Bucket: bucket,
-			Key:    prefix,
-			Size:   file.Size,
-			Log:    e.log,
+		if found, ferr := fileFromRepo(ctx, e.Repository, file); ferr == nil {
+			file = found
+		} else {
+			dl := download{
+				Bucket: bucket,
+				Key:    prefix,
+				File:   file,
+				Log:    e.log,
+			}
+			file, ferr = dl.Do(ctx, &e.staging)
+			if ferr != nil {
+				return ferr
+			}
 		}
-		file, err = dl.Do(ctx, &e.staging)
-		if err != nil {
-			return err
-		}
-		atomic.AddUint64(&e.downloadedSize, uint64(file.Size))
+		atomic.AddUint64(&e.transferredSize, uint64(file.Size))
 		e.mu.Lock()
 		e.Manifest.Result.Fileset.Map["."] = file
 		e.mu.Unlock()
 		return nil
 	}
-
+	rw := newRateExporter(internRate)
+	defer rw.Done()
 	scan := bucket.Scan(prefix)
 	for scan.Scan(ctx) {
 		key, file := scan.Key(), scan.File()
@@ -294,23 +376,27 @@ func (e *blobExec) do(ctx context.Context) error {
 			continue
 		}
 		g.Go(func() error {
-			dl := download{
-				Bucket: bucket,
-				Key:    key,
-				Size:   file.Size,
-				Log:    e.log,
+			if found, err := fileFromRepo(ctx, e.Repository, file); err == nil {
+				file = found
+			} else {
+				dl := download{
+					Bucket: bucket,
+					Key:    key,
+					File:   file,
+					Log:    e.log,
+				}
+				file, err = dl.Do(ctx, &e.staging)
+				if err != nil {
+					return err
+				}
 			}
-			file, err = dl.Do(ctx, &e.staging)
-			if err != nil {
-				return err
-			}
-			atomic.AddUint64(&e.downloadedSize, uint64(file.Size))
+			atomic.AddUint64(&e.transferredSize, uint64(file.Size))
 			e.mu.Lock()
 			e.Manifest.Result.Fileset.Map[key[nprefix:]] = file
 			e.mu.Unlock()
+			rw.Add(file.Size)
 			return nil
 		})
-
 	}
 	// Always wait for work to complete regardless of error.
 	// If there is an error, the context will be cancelled and
@@ -318,10 +404,66 @@ func (e *blobExec) do(ctx context.Context) error {
 	if err := g.Wait(); err != nil {
 		return err
 	}
-	if err := scan.Err(); err != nil {
+	return scan.Err()
+}
+
+func (e *blobExec) doExtern(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	e.canceler.Set(cancel)
+	if err := ctx.Err(); err != nil {
 		return err
 	}
-	return nil
+	if e.Config.Type != extern {
+		return errors.E("exec", e.ID(), errors.NotSupported, errors.Errorf("unsupported exec type %v", e.Config.Type))
+	}
+	bucket, prefix, err := e.Blob.Bucket(ctx, e.Config.URL)
+	if err != nil {
+		return err
+	}
+
+	if len(e.Config.Args) != 1 {
+		return errors.E(errors.Precondition,
+			errors.Errorf("unexpected args (must be 1, but was %d): %v", len(e.Config.Args), e.Config.Args))
+	}
+	fileset := e.Config.Args[0].Fileset.Pullup()
+
+	// Define the error group under which we will perform all of our fetches.
+	g, ctx := errgroup.WithContext(ctx)
+
+	e.mu.Lock()
+	e.Manifest.Result.Fileset.Map = map[string]reflow.File{}
+	e.mu.Unlock()
+
+	rw := newRateExporter(externRate)
+	defer rw.Done()
+	for k, v := range fileset.Map {
+		fn, f := k, v
+		g.Go(func() error {
+			key := path.Join(prefix, fn)
+			ul := upload{
+				Repository: e.Repository,
+				Bucket:     bucket,
+				Key:        key,
+				ID:         f.ID,
+				Size:       f.Size,
+				Log:        e.log,
+			}
+			err = ul.Do(ctx)
+			if err != nil {
+				return err
+			}
+			atomic.AddUint64(&e.transferredSize, uint64(f.Size))
+			e.mu.Lock()
+			e.Manifest.Result.Fileset.Map[fn] = f
+			e.mu.Unlock()
+			rw.Add(f.Size)
+			return nil
+		})
+	}
+	// Always wait for work to complete regardless of error.
+	// If there is an error, the context will be cancelled and
+	// waiting will be quick.
+	return g.Wait()
 }
 
 func (e *blobExec) Kill(ctx context.Context) error {
@@ -352,13 +494,27 @@ func (e *blobExec) Result(ctx context.Context) (reflow.Result, error) {
 		return reflow.Result{}, err
 	}
 	if state != execComplete {
-		return reflow.Result{}, errors.Errorf("result %v: exec not complete", e.ExecID)
+		return reflow.Result{}, errors.Errorf("result %v: %s", e.ExecID, errExecNotComplete)
 	}
 	return e.Manifest.Result, nil
 }
 
+// Promote promotes the blob exec data to the executor repository.
 func (e *blobExec) Promote(ctx context.Context) error {
-	return e.Repository.Vacuum(ctx, &e.staging)
+	// Promotion moves the objects in the staging repository to the executor's repository.
+	// The first call to Promote moves these objects and ref counts them. Later calls are
+	// a no-op.
+	// TODO(pgopal): Move promote to the exec state machine.
+	return e.promoteOnce.Do(func() error {
+		if e.transferType == intern {
+			res, err := e.Result(ctx)
+			if err != nil {
+				return err
+			}
+			return e.x.promote(ctx, res.Fileset, &e.staging)
+		}
+		return nil
+	})
 }
 
 // Inspect returns exec metadata.
@@ -374,24 +530,26 @@ func (e *blobExec) Inspect(ctx context.Context) (reflow.ExecInspect, error) {
 	switch state {
 	case execUnstarted, execInit, execCreated:
 		inspect.State = "initializing"
-		inspect.Status = "download has not yet started"
+		inspect.Status = fmt.Sprintf("%s has not yet started", e.transferTypeStr())
 	case execRunning:
-		inspect.Gauges = make(reflow.Gauges)
-		// These gauges values are racy: we can observe an outdated disk size
-		// with respect to tmp.
-		inspect.Gauges["disk"] = float64(atomic.LoadUint64(&e.downloadedSize))
-		path := e.path("download")
-		n, err := du(path)
-		if err != nil {
-			e.log.Errorf("du %s: %v", path, err)
-		} else {
-			inspect.Gauges["tmp"] = float64(n)
+		if e.transferType == intern {
+			inspect.Gauges = make(reflow.Gauges)
+			// These gauges values are racy: we can observe an outdated disk size
+			// with respect to tmp.
+			inspect.Gauges["disk"] = float64(atomic.LoadUint64(&e.transferredSize))
+			path := e.path("download")
+			n, err := du(path)
+			if err != nil {
+				e.log.Errorf("du %s: %v", path, err)
+			} else {
+				inspect.Gauges["tmp"] = float64(n)
+			}
 		}
 		inspect.State = "running"
-		inspect.Status = "downloading from bucket"
+		inspect.Status = fmt.Sprintf("%sing from/to bucket", e.transferTypeStr())
 	case execComplete:
 		inspect.State = "complete"
-		inspect.Status = "download complete"
+		inspect.Status = fmt.Sprintf("%s complete", e.transferTypeStr())
 	}
 	return inspect, nil
 }
@@ -413,52 +571,207 @@ func (e *blobExec) Shell(ctx context.Context) (io.ReadWriteCloser, error) {
 	return nil, errors.New("cannot shell into a file intern/extern")
 }
 
+// fileFromRepo gets the given file from the given repo.
+// Returns an error if the file does not contain ContentHash or it isn't found in repo.
+func fileFromRepo(ctx context.Context, repo *filerepo.Repository, f reflow.File) (file reflow.File, err error) {
+	if !f.ContentHash.IsZero() {
+		if file, err = repo.Stat(ctx, f.ContentHash); err == nil {
+			file.Source, file.ETag, file.LastModified = f.Source, f.ETag, f.LastModified
+			file.Assertions = blob.Assertions(file)
+		}
+	} else {
+		file, err = reflow.File{}, errors.New("No ContentHash")
+	}
+	return
+}
+
 type download struct {
 	Bucket blob.Bucket
 	Key    string
-	Size   int64
-	ETag   string
+	File   reflow.File
 	Log    *log.Logger
 }
 
 func (d *download) Do(ctx context.Context, repo *filerepo.Repository) (reflow.File, error) {
 	fetchingFiles.Add(1)
 	defer fetchingFiles.Add(-1)
-	f, err := repo.TempFile("download")
+	filename, err := d.download(ctx, repo)
 	if err != nil {
 		return reflow.File{}, err
 	}
 	defer func() {
-		if err := os.Remove(f.Name()); err != nil {
-			d.Log.Errorf("failed to remove file %q: %v", f.Name(), err)
+		if filename != "" {
+			if err := os.Remove(filename); err != nil {
+				d.Log.Errorf("remove %s: %v", filename, err)
+			}
 		}
-		f.Close()
 	}()
 	var w bytewatch
 	w.Reset()
-	d.Log.Printf("download %s%s (%s) to %s", d.Bucket.Location(), d.Key, data.Size(d.Size), f.Name())
-	downloadingFiles.Add(1)
-	_, err = d.Bucket.Download(ctx, d.Key, d.ETag, f)
-	downloadingFiles.Add(-1)
-	if err != nil {
-		d.Log.Printf("download %s%s: %v", d.Bucket.Location(), d.Key, err)
-		return reflow.File{}, err
-	}
-	dur, bps := w.Lap(d.Size)
-	d.Log.Printf("done %s%s in %s (%s/s)", d.Bucket.Location(), d.Key, dur, data.Size(bps))
-	w.Reset()
 	digestingFiles.Add(1)
-	file, err := repo.Install(f.Name())
+	file, err := repo.Install(filename)
 	digestingFiles.Add(-1)
-	if err == nil && file.Size != d.Size {
-		err = errors.E(errors.Integrity,
-			errors.Errorf("expected size %d does not match actual size %d", d.Size, file.Size))
+	if err == nil {
+		if !d.File.ContentHash.IsZero() && file.ID != d.File.ContentHash {
+			err = errors.E(errors.Integrity, fmt.Errorf("digest %v (expected) != %v (actual)", d.File.ContentHash, file.ID))
+		}
+		if file.Size != d.File.Size {
+			err = errors.E(errors.Integrity, fmt.Errorf("size %d (expected) != %d (actual)", d.File.Size, file.Size))
+		}
 	}
 	if err != nil {
 		d.Log.Errorf("install %s%s: %v", d.Bucket.Location(), d.Key, err)
 	} else {
-		dur, bps := w.Lap(d.Size)
-		d.Log.Printf("installed %s%s to %v in %s (%s/s)", d.Bucket.Location(), d.Key, f, dur, data.Size(bps))
+		file.Source, file.ETag, file.LastModified = d.File.Source, d.File.ETag, d.File.LastModified
+		file.Assertions = blob.Assertions(file)
+		dur, bps := w.Lap(d.File.Size)
+		d.Log.Printf("installed %s%s to %v in %s (%s/s)", d.Bucket.Location(), d.Key, filename, dur, data.Size(bps))
 	}
 	return file, err
+}
+
+func (d *download) download(ctx context.Context, repo *filerepo.Repository) (string, error) {
+	f := newLazyWriterAt(func() (namedWriterAtCloser, error) {
+		downloadingFiles.Add(1)
+		file, err := repo.TempFile("download")
+		if err == nil {
+			d.Log.Printf("download %s%s (%s) to %s", d.Bucket.Location(), d.Key, data.Size(d.File.Size), file.Name())
+		}
+		return file, err
+	})
+	defer func() {
+		if err := f.Close(); err != nil {
+			d.Log.Errorf("close %s: %v", f.Name(), err)
+		}
+	}()
+	var w bytewatch
+	w.Reset()
+	_, err := d.Bucket.Download(ctx, d.Key, d.File.ETag, d.File.Size, f)
+	downloadingFiles.Add(-1)
+	if err != nil {
+		d.Log.Printf("download %s%s: %v", d.Bucket.Location(), d.Key, err)
+		return "", err
+	}
+	dur, bps := w.Lap(d.File.Size)
+	d.Log.Printf("done %s%s in %s (%s/s)", d.Bucket.Location(), d.Key, dur, data.Size(bps))
+	return f.Name(), err
+}
+
+// namedWriterAtCloser combines different interfaces for use by lazyWriterAt.
+type namedWriterAtCloser interface {
+	io.WriterAt
+	io.Closer
+	Name() string
+}
+
+// lazyWriterAt implements a lazy file opener which delays opening a file until `WriteAt` is called.
+// This is to avoid having too many file descriptors open when we intend to download and write to a lot of files,
+// while doing so with various concurrency limits limiting the number of files being processed concurrently.
+type lazyWriterAt struct {
+	namedWriterAtCloser
+	opener   func() (namedWriterAtCloser, error)
+	openErr  error
+	openOnce sync.Once
+}
+
+func newLazyWriterAt(opener func() (namedWriterAtCloser, error)) namedWriterAtCloser {
+	return &lazyWriterAt{opener: opener}
+}
+
+func (w *lazyWriterAt) ensureOpen() {
+	w.openOnce.Do(func() {
+		w.namedWriterAtCloser, w.openErr = w.opener()
+	})
+}
+
+func (w *lazyWriterAt) WriteAt(p []byte, off int64) (n int, err error) {
+	w.ensureOpen()
+	if w.openErr != nil {
+		return 0, w.openErr
+	}
+	return w.namedWriterAtCloser.WriteAt(p, off)
+}
+
+func (w *lazyWriterAt) Close() error {
+	w.ensureOpen()
+	if w.openErr != nil {
+		return w.openErr
+	}
+	return w.namedWriterAtCloser.Close()
+}
+
+func (w *lazyWriterAt) Name() string {
+	w.ensureOpen()
+	if w.openErr != nil {
+		return ""
+	}
+	return w.namedWriterAtCloser.Name()
+}
+
+type upload struct {
+	Repository *filerepo.Repository
+	Bucket     blob.Bucket
+	Key        string
+	ID         digest.Digest
+	Size       int64
+	Log        *log.Logger
+}
+
+func (u *upload) Do(ctx context.Context) error {
+	f := newLazyReadCloser(func() (io.ReadCloser, error) {
+		uploadingFiles.Add(1)
+		file, err := u.Repository.Get(ctx, u.ID)
+		if err == nil {
+			u.Log.Printf("upload %s (%s) to %s%s", u.Key, data.Size(u.Size), u.Bucket.Location(), u.Key)
+		}
+		return file, err
+	})
+	defer func() {
+		if err := f.Close(); err != nil {
+			_, path := u.Repository.Path(u.ID)
+			u.Log.Errorf("close %s: %v", path, err)
+		}
+	}()
+	var w bytewatch
+	w.Reset()
+	err := u.Bucket.Put(ctx, u.Key, u.Size, f, u.ID.Hex())
+	uploadingFiles.Add(-1)
+	if err != nil {
+		u.Log.Printf("upload %s/%s: %v", u.Bucket.Location(), u.Key, err)
+		return err
+	}
+	dur, bps := w.Lap(u.Size)
+	u.Log.Printf("done %s/%s in %s (%s/s)", u.Bucket.Location(), u.Key, dur, data.Size(bps))
+	return nil
+}
+
+// lazyReadCloser implements a lazy file opener which delays opening a file until `Read` is called.
+// This is to avoid having too many file descriptors open when we intend to read from and upload a lot of files,
+// while doing so with various concurrency limits limiting the number of files being processed concurrently.
+type lazyReadCloser struct {
+	io.ReadCloser
+	opener   func() (io.ReadCloser, error)
+	openErr  error
+	openOnce sync.Once
+}
+
+func newLazyReadCloser(opener func() (io.ReadCloser, error)) io.ReadCloser {
+	return &lazyReadCloser{opener: opener}
+}
+
+func (r *lazyReadCloser) Read(p []byte) (n int, err error) {
+	r.openOnce.Do(func() {
+		r.ReadCloser, r.openErr = r.opener()
+	})
+	if r.openErr != nil {
+		return 0, r.openErr
+	}
+	return r.ReadCloser.Read(p)
+}
+
+func (r *lazyReadCloser) Close() error {
+	if r.ReadCloser != nil {
+		return r.ReadCloser.Close()
+	}
+	return nil
 }

@@ -10,11 +10,12 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types"
+	"docker.io/go-docker/api/types"
 	"github.com/grailbio/base/data"
 	"github.com/grailbio/base/digest"
 	"github.com/grailbio/reflow/errors"
@@ -69,7 +70,7 @@ type Arg struct {
 	Index int
 }
 
-// ExecConfig  contains all the necessary information to perform an
+// ExecConfig contains all the necessary information to perform an
 // exec.
 type ExecConfig struct {
 	// The type of exec: "exec", "intern", "extern"
@@ -84,6 +85,9 @@ type ExecConfig struct {
 
 	// exec: the docker image used to perform an exec
 	Image string
+
+	// The docker image that is specified by the user
+	OriginalImage string
 
 	// exec: the Sprintf-able command that is to be run inside of the
 	// Docker image.
@@ -101,6 +105,9 @@ type ExecConfig struct {
 	// AWS_SESSION_TOKEN will be available with the user's default
 	// credentials.
 	NeedAWSCreds bool
+
+	// NeedDockerAccess indicates that the exec needs access to the host docker daemon
+	NeedDockerAccess bool
 
 	// OutputIsDir tells whether an output argument (by index)
 	// is a directory.
@@ -127,8 +134,12 @@ func (e ExecConfig) String() string {
 	return s
 }
 
-// Profile stores keyed statistical summaries (currently: mean, max).
-type Profile map[string]struct{ Max, Mean float64 }
+// Profile stores keyed statistical summaries (currently: mean, max, N).
+type Profile map[string]struct {
+	Max, Mean, Var float64
+	N              int64
+	First, Last    time.Time
+}
 
 func (p Profile) String() string {
 	var keys []string
@@ -141,7 +152,7 @@ func (p Profile) String() string {
 		if i > 0 {
 			b.WriteString("; ")
 		}
-		fmt.Fprintf(&b, "%s: mean %v max %v", k, p[k].Mean, p[k].Max)
+		fmt.Fprintf(&b, "%s: mean %v max %v N %v var %v", k, p[k].Mean, p[k].Max, p[k].N, p[k].Var)
 	}
 	return b.String()
 }
@@ -172,8 +183,10 @@ type ExecInspect struct {
 	Gauges Gauges
 	// Commands running from top, for live inspection.
 	Commands []string
-
-	Docker types.ContainerJSON // Docker inspect output.
+	// Docker inspect output.
+	Docker types.ContainerJSON
+	// ExecError stores exec result errors.
+	ExecError *errors.Error `json:",omitempty"`
 }
 
 // Runtime computes the exec's runtime based on Docker's timestamps.
@@ -191,10 +204,11 @@ func (e ExecInspect) Runtime() time.Duration {
 	if err != nil {
 		return time.Duration(0)
 	}
-	if end.Before(start) {
-		end = time.Now()
+	diff := end.Sub(start)
+	if diff < time.Duration(0) {
+		diff = time.Duration(0)
 	}
-	return end.Sub(start)
+	return diff
 }
 
 // Resources describes a set of labeled resources. Each resource is
@@ -338,6 +352,16 @@ func (r Resources) Equal(s Resources) bool {
 	return true
 }
 
+// Div returns a mapping of each key in s to the fraction r[key]/s[key].
+// Since the returned value cannot be treated as Resources, Div simply returns a map.
+func (r Resources) Div(s Resources) map[string]float64 {
+	f := make(map[string]float64)
+	for key := range s {
+		f[key] = r[key] / s[key]
+	}
+	return f
+}
+
 // Requirements stores resource requirements, comprising the minimum
 // amount of acceptable resources and a width.
 type Requirements struct {
@@ -346,20 +370,8 @@ type Requirements struct {
 	Min Resources
 	// Width is the width of the requirements. A width of zero indicates
 	// a "narrow" job: minimum describes the exact resources needed.
-	// Widths greater than zero are "wide" requests: they require some
-	// multiple of the minimum requirement. The distinction between a
-	// width of zero and a width of one is a little subtle: width
-	// represents the smallest acceptable width, and thus a width of 1
-	// can be taken as a hint to allocate a higher multiple of the
-	// minimum requirements, whereas a width of 0 represents a precise
-	// requirement: allocating any more is likely to be wasteful.
+	// Widths greater than zero require a multiple of the minimum requirement.
 	Width int
-}
-
-// Wide returns whether these requirements represent a
-// wide resource request.
-func (r *Requirements) Wide() bool {
-	return r.Width > 0
 }
 
 // AddParallel adds the provided resources s to the requirements,
@@ -438,12 +450,13 @@ type Exec interface {
 	Shell(ctx context.Context) (io.ReadWriteCloser, error)
 
 	// Promote installs this exec's objects into the alloc's repository.
+	// Promote assumes that the Exec is complete. i.e. Wait returned successfully.
 	Promote(context.Context) error
 }
 
 // Executor manages Execs and their values.
 type Executor interface {
-	// Put creates a new Exec at id. It it idempotent.
+	// Put creates a new Exec at id. It is idempotent.
 	Put(ctx context.Context, id digest.Digest, exec ExecConfig) (Exec, error)
 
 	// Get retrieves the Exec named id.
@@ -455,10 +468,19 @@ type Executor interface {
 	// Execs lists all Execs known to the Executor.
 	Execs(ctx context.Context) ([]Exec, error)
 
-	// Load fetches missing files from an un-resolved fileset
-	// into the executor's repository. The resolved fileset is
-	// returned.
-	Load(ctx context.Context, fs Fileset) (Fileset, error)
+	// Load fetches missing files into the executor's repository. Load fetches
+	// resolved files from the specified backing repository and unresolved files
+	// directly from the source. The resolved fileset is returned and is available
+	// on the executor on successful return. The client has to explicitly unload the
+	// files to free them.
+	Load(ctx context.Context, repo *url.URL, fileset Fileset) (Fileset, error)
+
+	// VerifyIntegrity verifies the integrity of the given set of files
+	VerifyIntegrity(ctx context.Context, fileset Fileset) error
+
+	// Unload the data from the executor's repository. Any use of the unloaded files
+	// after the successful return of Unload is undefined.
+	Unload(ctx context.Context, fileset Fileset) error
 
 	// Resources indicates the total amount of resources available at the Executor.
 	Resources() Resources

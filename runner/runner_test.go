@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"github.com/grailbio/reflow"
+	"github.com/grailbio/reflow/flow"
 	"github.com/grailbio/reflow/pool"
-	"github.com/grailbio/reflow/test/flow"
+	"github.com/grailbio/reflow/taskdb"
+	op "github.com/grailbio/reflow/test/flow"
 	"github.com/grailbio/reflow/test/testutil"
 )
 
@@ -56,6 +58,8 @@ func (t *testCluster) Allocate(ctx context.Context, req reflow.Requirements, lab
 	}
 }
 
+func (t *testCluster) Shutdown() error { return nil }
+
 func (t *testCluster) Grant(req reflow.Requirements, result allocateResult) {
 	t.allocate(req) <- result
 }
@@ -83,13 +87,16 @@ func TestRunner(t *testing.T) {
 		transferer testutil.WaitTransferer
 		cluster    testCluster
 		resources  = reflow.Resources{"mem": 5 << 30, "cpu": 10, "disk": 10 << 30}
-		r          = &Runner{
+
+		r = &Runner{
 			Cluster:    &cluster,
 			Transferer: &transferer,
-			Flow:       flow.Exec("image", "blah", resources),
+			Flow:       op.Exec("image", "blah", resources),
+			EvalConfig: flow.EvalConfig{},
 		}
 	)
-	r.ID = reflow.Digester.FromString("test")
+	testutil.AssignExecId(nil, r.Flow)
+	r.ID = taskdb.RunID(reflow.Digester.FromString("test"))
 	transferer.Init()
 	cluster.Init()
 
@@ -97,7 +104,7 @@ func TestRunner(t *testing.T) {
 		c  = make(chan *Runner)
 		rc = make(chan bool)
 	)
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	defer close(c)
 	go func() {
@@ -118,7 +125,7 @@ func TestRunner(t *testing.T) {
 		t.Errorf("got %v, want %v", got, want)
 	}
 	c <- r
-	alloc.Ok(r.Flow, testutil.Files("ok"))
+	alloc.Ok(ctx, r.Flow, testutil.Files("ok"))
 	if <-rc {
 		t.Fatal("late termination")
 	}

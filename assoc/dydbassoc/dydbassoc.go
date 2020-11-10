@@ -8,6 +8,7 @@ package dydbassoc
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"strconv"
 	"sync"
@@ -16,12 +17,20 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/request"
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
+	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbattribute"
+	"github.com/aws/aws-sdk-go/service/dynamodb/dynamodbiface"
 	"github.com/grailbio/base/digest"
 	"github.com/grailbio/base/limiter"
+	"github.com/grailbio/base/retry"
+	"github.com/grailbio/base/traverse"
+	"github.com/grailbio/infra"
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/assoc"
 	"github.com/grailbio/reflow/errors"
+	"github.com/grailbio/reflow/flow"
 	"github.com/grailbio/reflow/liveset"
 	"github.com/grailbio/reflow/log"
 	"github.com/grailbio/reflow/pool"
@@ -29,9 +38,27 @@ import (
 	"golang.org/x/time/rate"
 )
 
+func init() {
+	infra.Register("dynamodbassoc", new(Assoc))
+}
+
 const (
-	dbmaxdeleteobjects  = 25
-	dbmaxdeleteattempts = 6
+	// getTimeout is the timeout used for a single DynamoDB get request.
+	getTimeout = 30 * time.Second
+
+	// Default provisioned capacities for DynamoDB.
+	writecap = 10
+	readcap  = 20
+)
+
+var (
+	colmap = map[assoc.Kind]string{
+		assoc.Fileset:     "Value",
+		assoc.Logs:        "Logs",
+		assoc.Bundle:      "Bundle",
+		assoc.ExecInspect: "ExecInspect",
+	}
+	backOffPolicy = retry.MaxTries(retry.Backoff(2*time.Millisecond, time.Minute, 1), 10)
 )
 
 // Assoc implements a DynamoDB-backed Assoc for use in caches.
@@ -41,14 +68,145 @@ const (
 // TODO(marius): support batch querying in this interface; it will be
 // more efficient than relying on call concurrency.
 type Assoc struct {
-	DB        *dynamodb.DynamoDB
-	Limiter   *limiter.Limiter
-	TableName string
+	DB        dynamodbiface.DynamoDBAPI `yaml:"-"`
+	Limiter   *limiter.Limiter          `yaml:"-"`
+	TableName string                    `yaml:"-"`
 	// Labels to assign to cache entries.
-	Labels pool.Labels
+	Labels pool.Labels `yaml:"-"`
 
-	labelsOnce sync.Once
-	labels     []*string
+	labelsOnce sync.Once `yaml:"-"`
+	labels     []*string `yaml:"-"`
+}
+
+func (a *Assoc) String() string {
+	return fmt.Sprintf("%T,TableName=%s", a, a.TableName)
+}
+
+// Help implements infra.Provider.
+func (a *Assoc) Help() string {
+	return "configure an assoc using the provided DynamoDB table name"
+}
+
+// Init implements infra.Provider.
+func (a *Assoc) Init(sess *session.Session, labels pool.Labels) error {
+	lim := limiter.New()
+	lim.Release(32)
+	a.DB = dynamodb.New(sess)
+	a.Limiter = lim
+	a.Labels = labels.Copy()
+	return nil
+}
+
+// Setup implements infra.Provider.
+func (a *Assoc) Setup(sess *session.Session, logger *log.Logger) error {
+	log.Printf("creating DynamoDB table %s", a.TableName)
+	db := dynamodb.New(sess)
+	_, err := db.CreateTable(&dynamodb.CreateTableInput{
+		AttributeDefinitions: []*dynamodb.AttributeDefinition{
+			{
+				AttributeName: aws.String("ID"),
+				AttributeType: aws.String("S"),
+			},
+		},
+		KeySchema: []*dynamodb.KeySchemaElement{
+			{
+				AttributeName: aws.String("ID"),
+				KeyType:       aws.String("HASH"),
+			},
+		},
+		BillingMode: aws.String("PAY_PER_REQUEST"),
+		TableName:   aws.String(a.TableName),
+	})
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); !ok || aerr.Code() != dynamodb.ErrCodeResourceInUseException {
+			log.Fatal(err)
+		}
+		log.Printf("dynamodb table %s already exists", a.TableName)
+	} else {
+		log.Printf("created DynamoDB table %s", a.TableName)
+	}
+	const indexName = "ID4-ID-index"
+	var describe *dynamodb.DescribeTableOutput
+	start := time.Now()
+	for {
+		describe, err = db.DescribeTable(&dynamodb.DescribeTableInput{
+			TableName: aws.String(a.TableName),
+		})
+		if err != nil {
+			return err
+		}
+		status := *describe.Table.TableStatus
+		if status == "ACTIVE" {
+			break
+		}
+
+		if time.Since(start) > time.Minute {
+			return errors.New("waited for table to become active for too long; try again later")
+		}
+		log.Printf("waiting for table to become active; current status: %v", status)
+		time.Sleep(4 * time.Second)
+	}
+	var exists bool
+	for _, index := range describe.Table.GlobalSecondaryIndexes {
+		if *index.IndexName == indexName {
+			exists = true
+			break
+		}
+	}
+	if exists {
+		log.Printf("dynamodb index %s already exists", indexName)
+	} else {
+		// Create a secondary index to look up keys by their ID4-prefix.
+		_, err = db.UpdateTable(&dynamodb.UpdateTableInput{
+			TableName: aws.String(a.TableName),
+			AttributeDefinitions: []*dynamodb.AttributeDefinition{
+				{
+					AttributeName: aws.String("ID"),
+					AttributeType: aws.String("S"),
+				},
+				// DynamoDB has to know about the attribute type to index it
+				{
+					AttributeName: aws.String("ID4"),
+					AttributeType: aws.String("S"),
+				},
+			},
+			GlobalSecondaryIndexUpdates: []*dynamodb.GlobalSecondaryIndexUpdate{
+				{
+					Create: &dynamodb.CreateGlobalSecondaryIndexAction{
+						IndexName: aws.String(indexName),
+						KeySchema: []*dynamodb.KeySchemaElement{
+							{
+								KeyType:       aws.String("HASH"),
+								AttributeName: aws.String("ID4"),
+							},
+							{
+								KeyType:       aws.String("RANGE"),
+								AttributeName: aws.String("ID"),
+							},
+						},
+						Projection: &dynamodb.Projection{
+							ProjectionType: aws.String("ALL"),
+						},
+					},
+				},
+			},
+		})
+		if err != nil {
+			return errors.E("error creating secondary index: %v", err)
+		}
+		log.Printf("created secondary index %s", indexName)
+	}
+	return nil
+}
+
+// Flags implements infra.Provider.
+func (a *Assoc) Flags(flags *flag.FlagSet) {
+	flags.StringVar(&a.TableName, "table", "", "name of the dynamodb table")
+}
+
+// Version implements infra.Provider.
+func (a *Assoc) Version() int {
+	return 1
 }
 
 // Store associates the digest v with the key digest k of the provided kind. If v is zero,
@@ -92,6 +250,31 @@ func (a *Assoc) Store(ctx context.Context, kind assoc.Kind, k, v digest.Digest) 
 		return errors.E(errors.Precondition, err)
 	}
 	return err
+}
+
+// Delete deletes the key k unconditionally from the provided assoc.
+func (a *Assoc) Delete(ctx context.Context, k digest.Digest) error {
+	input := &dynamodb.DeleteItemInput{
+		Key: map[string]*dynamodb.AttributeValue{
+			"ID": {
+				S: aws.String(k.String()),
+			},
+		},
+		ReturnValues: aws.String("ALL_OLD"),
+		TableName:    aws.String(a.TableName),
+	}
+	output, err := a.DB.DeleteItemWithContext(ctx, input)
+	if err != nil {
+		return err
+	}
+	var keyFound bool
+	if output != nil {
+		_, keyFound = output.Attributes["ID"]
+	}
+	if !keyFound {
+		return errors.E(errors.NotExist, fmt.Errorf("key %s not found", k))
+	}
+	return nil
 }
 
 func (a *Assoc) getUpdateComponents(kind assoc.Kind, k, v digest.Digest) (expr string, av map[string]*dynamodb.AttributeValue, an map[string]*string) {
@@ -157,11 +340,10 @@ func (a *Assoc) getUpdateComponents(kind assoc.Kind, k, v digest.Digest) (expr s
 	return
 }
 
-// Lookup returns the digest associated with key digest k. Lookup
+// Get returns the digest associated with key digest k. Lookup
 // returns an error flagged errors.NotExist when no such mapping
 // exists. Lookup also modifies the item's last-accessed time, which
 // can be used for LRU object garbage collection.
-//
 // Get expands abbreviated keys by making use of a DynamoDB index.
 func (a *Assoc) Get(ctx context.Context, kind assoc.Kind, k digest.Digest) (digest.Digest, digest.Digest, error) {
 	var v digest.Digest
@@ -185,6 +367,8 @@ func (a *Assoc) Get(ctx context.Context, kind assoc.Kind, k digest.Digest) (dige
 		return k, v, err
 	}
 	defer a.Limiter.Release(1)
+	ctx, cancel := context.WithTimeout(ctx, getTimeout)
+	defer cancel()
 	var item *dynamodb.AttributeValue
 	if k.IsAbbrev() {
 		resp, err := a.DB.Query(&dynamodb.QueryInput{
@@ -272,32 +456,165 @@ func (a *Assoc) Get(ctx context.Context, kind assoc.Kind, k digest.Digest) (dige
 	return k, v, nil
 }
 
-const updaterConcurrency = 10
+// BatchGet implements the assoc interface. BatchGet will return a result for each key in the batch.
+// BatchGet could internally split the keys into several batches. Any global errors, like context
+// cancellation, S3 API errors or a key parse error would be returned from BatchGet. Any value parse
+// errors would be returned as part of the result for that key.
+func (a *Assoc) BatchGet(ctx context.Context, batch assoc.Batch) error {
+	unique := make(map[digest.Digest]map[assoc.Kind]bool)
+	for k := range batch {
+		if _, ok := unique[k.Digest]; !ok {
+			unique[k.Digest] = make(map[assoc.Kind]bool)
+		}
+		unique[k.Digest][k.Kind] = true
+	}
+	// Dynamodb BatchGetItemWithContext has API limitation of 100 keys per batch request.
+	const maxKeysPerBatch = 100
+	numBatches := (len(unique) + maxKeysPerBatch - 1) / maxKeysPerBatch
+	keys := make([]digest.Digest, 0, len(unique))
+	for k := range unique {
+		keys = append(keys, k)
+	}
 
-// cell identifies a row,col we want to remove.
-type cell struct {
-	K    digest.Digest
-	Kind assoc.Kind
+	batches := make([]map[assoc.Key]assoc.Result, numBatches)
+	err := traverse.Each(numBatches, func(batch int) error {
+		end := maxKeysPerBatch * (batch + 1)
+		if end > len(keys) {
+			end = len(keys)
+		}
+		keys := keys[maxKeysPerBatch*batch : end]
+		batches[batch] = make(map[assoc.Key]assoc.Result)
+		input := dynamodb.BatchGetItemInput{RequestItems: map[string]*dynamodb.KeysAndAttributes{
+			a.TableName: &dynamodb.KeysAndAttributes{},
+		}}
+		for _, k := range keys {
+			av := map[string]*dynamodb.AttributeValue{
+				"ID": {
+					S: aws.String(k.String()),
+				},
+			}
+			input.RequestItems[a.TableName].Keys = append(input.RequestItems[a.TableName].Keys, av)
+		}
+		for retries := 0; ; {
+			var (
+				output *dynamodb.BatchGetItemOutput
+				err    error
+			)
+			if output, err = a.DB.BatchGetItemWithContext(ctx, &input); err != nil {
+				if !request.IsErrorThrottle(err) {
+					return err
+				}
+				if err := retry.Wait(ctx, backOffPolicy, retries); err != nil {
+					return err
+				}
+				retries++
+				continue
+			}
+			for _, it := range output.Responses[a.TableName] {
+				key := it["ID"].S
+				k, err := reflow.Digester.Parse(*key)
+				if err != nil {
+					return err
+				}
+				kinds := unique[k]
+				for kind := range kinds {
+					if _, ok := it[colmap[kind]]; !ok {
+						continue
+					}
+					// TODO(pgopal) - this assumes that the value is of type string. Today we store lists too.
+					// But we don't call batchget for those types. We should ideally handle all types.
+					value := it[colmap[kind]].S
+					v, err := reflow.Digester.Parse(*value)
+					if err != nil {
+						batches[batch][assoc.Key{Digest: k, Kind: kind}] = assoc.Result{Error: err}
+						continue
+					}
+					batches[batch][assoc.Key{Digest: k, Kind: kind}] = assoc.Result{Digest: v}
+				}
+			}
+			input.RequestItems[a.TableName].Keys = input.RequestItems[a.TableName].Keys[:0]
+			if _, ok := output.UnprocessedKeys[a.TableName]; ok {
+				input.RequestItems[a.TableName].Keys = output.UnprocessedKeys[a.TableName].Keys
+			}
+			if len(input.RequestItems[a.TableName].Keys) == 0 {
+				return nil
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	var cacheKeys = make([]digest.Digest, 0, len(batches))
+	for _, b := range batches {
+		for k, v := range b {
+			if v.Error == nil {
+				cacheKeys = append(cacheKeys, k.Digest)
+			}
+			batch[k] = v
+		}
+	}
+	if len(cacheKeys) <= 0 {
+		return nil
+	}
+
+	// Asynchronously update LastAccessTime and AccessCount for each accessed key.
+	updateCtx := flow.Background(ctx)
+	go func() {
+		_ = traverse.Each(len(cacheKeys), func(i int) error {
+			if err := a.Limiter.Acquire(updateCtx, 1); err != nil {
+				return nil
+			}
+			defer a.Limiter.Release(1)
+			input := &dynamodb.UpdateItemInput{
+				Key: map[string]*dynamodb.AttributeValue{
+					"ID": {
+						S: aws.String(cacheKeys[i].String()),
+					},
+				},
+				TableName:        aws.String(a.TableName),
+				UpdateExpression: aws.String("SET LastAccessTime = :time ADD AccessCount :one"),
+				ExpressionAttributeValues: map[string]*dynamodb.AttributeValue{
+					":time": {N: aws.String(fmt.Sprint(time.Now().Unix()))},
+					":one":  {N: aws.String("1")},
+				},
+			}
+			_, err := a.DB.UpdateItemWithContext(updateCtx, input)
+			if err != nil && err != updateCtx.Err() {
+				awserr, ok := err.(awserr.Error)
+				// The AWS SDK decides to override context cancellation
+				// with its own non-standard error.
+				if !ok || awserr.Code() != "RequestCanceled" {
+					log.Errorf("dynamodb: update %v: %v", cacheKeys[i], err)
+				}
+			}
+			return nil
+		})
+		updateCtx.Complete()
+	}()
+	return nil
 }
 
+const updaterConcurrency = 10
+
 type updater struct {
-	cells chan *cell
-	a     *Assoc
-	rate  int64
+	keys chan digest.Digest
+	a    *Assoc
+	rate int64
 }
 
 func (u *updater) Go(ctx context.Context) error {
 	rl := rate.NewLimiter(rate.Limit(u.rate), 1)
 	g, ctx := errgroup.WithContext(ctx)
-	retries := make(chan *cell, updaterConcurrency+1)
+	retries := make(chan digest.Digest, updaterConcurrency+1)
 	for i := 0; i < updaterConcurrency; i++ {
 		g.Go(func() error {
 			for {
-				var c *cell
+				var d digest.Digest
 				select {
-				case c = <-retries:
-				case c = <-u.cells:
-					if c == nil {
+				case d = <-retries:
+				case d = <-u.keys:
+					if d.IsZero() {
 						return nil
 					}
 				case <-ctx.Done():
@@ -307,7 +624,7 @@ func (u *updater) Go(ctx context.Context) error {
 				if err != nil {
 					return err
 				}
-				err = u.a.Store(ctx, c.Kind, c.K, digest.Digest{})
+				err = u.a.Delete(ctx, d)
 				if awserr, ok := err.(awserr.Error); ok {
 					switch awserr.Code() {
 					case "ThrottlingException", "ProvisionedThroughputExceededException":
@@ -315,12 +632,15 @@ func (u *updater) Go(ctx context.Context) error {
 						// Writes to u.cells can block all threads and deadlock (since we have
 						// an external writer). Write to a separate channel that only the
 						// updater threads know about.
-						retries <- c
+						retries <- d
 					default:
 						return err
 					}
 				}
-				if err != nil {
+				// An errors.NotExist from a non-aws error indicates that
+				// the key (d) does not exist in the assoc. This specific
+				// error should not prevent the deletion of other keys.
+				if err != nil && !errors.Is(errors.NotExist, err) {
 					return err
 				}
 			}
@@ -349,14 +669,14 @@ func (c *counter) Get() int64 {
 
 // CollectWithThreshold removes from this Assoc any objects whose keys are not in the
 // liveset and have not been accessed more recently than the liveset's threshold
-func (a *Assoc) CollectWithThreshold(ctx context.Context, live liveset.Liveset, kind assoc.Kind, threshold time.Time, rate int64, dryRun bool) error {
+func (a *Assoc) CollectWithThreshold(ctx context.Context, live liveset.Liveset, dead liveset.Liveset, threshold time.Time, rate int64, dryRun bool) error {
 	log.Debug("Collecting association")
 	scanner := newScanner(a)
 
-	var itemsCheckedCount, liveItemsCount, afterThresholdCount, itemsCollectedCount counter
+	var itemsCheckedCount, liveItemsCount, afterThresholdCount, itemsCollectedCount, deadFilterCount counter
 	start := time.Now()
 
-	updater := &updater{cells: make(chan *cell), a: a, rate: rate}
+	updater := &updater{keys: make(chan digest.Digest), a: a, rate: rate}
 	errch := make(chan error)
 	if !dryRun {
 		go func() {
@@ -387,14 +707,21 @@ func (a *Assoc) CollectWithThreshold(ctx context.Context, live liveset.Liveset, 
 
 			mu.Lock()
 			contains := live.Contains(d)
+			remove := dead.Contains(d)
 			mu.Unlock()
 			if contains {
 				liveItemsCount.Add(1)
+			} else if remove {
+				if !dryRun {
+					updater.keys <- d
+				}
+				itemsCollectedCount.Add(1)
+				deadFilterCount.Add(1)
 			} else if time.Unix(itemAccessTime, 0).After(threshold) {
 				afterThresholdCount.Add(1)
 			} else {
 				if !dryRun {
-					updater.cells <- &cell{d, kind}
+					updater.keys <- d
 				}
 				itemsCollectedCount.Add(1)
 			}
@@ -402,7 +729,7 @@ func (a *Assoc) CollectWithThreshold(ctx context.Context, live liveset.Liveset, 
 		return nil
 	}))
 	if !dryRun {
-		close(updater.cells)
+		close(updater.keys)
 		<-errch
 	}
 
@@ -414,8 +741,8 @@ func (a *Assoc) CollectWithThreshold(ctx context.Context, live liveset.Liveset, 
 	if !dryRun {
 		action = "were"
 	}
-	log.Printf("%d of %d associations (%.2f%%) %s collected",
-		itemsCollectedCount.Get(), itemsCheckedCount.Get(), float64(itemsCollectedCount.Get())/float64(itemsCheckedCount.Get())*100, action)
+	log.Printf("%d of %d associations (%.2f%%) %s collected (%d associations matched the dead set)",
+		itemsCollectedCount.Get(), itemsCheckedCount.Get(), float64(itemsCollectedCount.Get())/float64(itemsCheckedCount.Get())*100, action, deadFilterCount.Get())
 
 	return err
 }
@@ -438,8 +765,13 @@ func (a *Assoc) Count(ctx context.Context) (int64, error) {
 
 // Scan calls the handler function for every association in the mapping.
 // Note that the handler function may be called asynchronously from multiple threads.
-func (a *Assoc) Scan(ctx context.Context, mappingHandler assoc.MappingHandler) error {
+func (a *Assoc) Scan(ctx context.Context, kind assoc.Kind, mappingHandler assoc.MappingHandler) error {
 	scanner := newScanner(a)
+	colname, ok := colmap[kind]
+	if !ok {
+		panic("invalid kind")
+	}
+
 	return scanner.Scan(ctx, ItemsHandlerFunc(func(items Items) error {
 		for _, item := range items {
 			itemAccessTime := int64(0)
@@ -447,21 +779,52 @@ func (a *Assoc) Scan(ctx context.Context, mappingHandler assoc.MappingHandler) e
 			if item["LastAccessTime"] != nil {
 				itemAccessTime, err = strconv.ParseInt(*item["LastAccessTime"].N, 10, 64)
 				if err != nil {
-					return fmt.Errorf("invalid dynamodb entry %v", item)
+					log.Errorf("invalid dynamodb entry %v", item)
+					continue
 				}
 			}
 			k, err := reflow.Digester.Parse(*item["ID"].S)
 			if err != nil {
-				return fmt.Errorf("invalid dynamodb entry %v", item)
-			}
-			if item["Value"] != nil {
-				v, err := reflow.Digester.Parse(*item["Value"].S)
-				if err != nil {
-					return fmt.Errorf("invalid dynamodb entry %v", item)
-				}
-				mappingHandler.HandleMapping(k, v, assoc.Fileset, time.Unix(itemAccessTime, 0))
+				log.Errorf("invalid dynamodb entry %v", item)
+				continue
 			}
 
+			if item[colname] != nil {
+				var labels []string
+				if item["Labels"] != nil {
+					err := dynamodbattribute.Unmarshal(item["Labels"], &labels)
+					if err != nil {
+						log.Errorf("invalid label: %v", err)
+						continue
+					}
+				}
+
+				dbval := *item[colname]
+				var v []digest.Digest
+				switch kind {
+				case assoc.Fileset:
+					d, err := reflow.Digester.Parse(*dbval.S)
+					if err != nil {
+						log.Errorf("invalid digest of kind %v for dynamodb entry %v", kind, item)
+						continue
+					}
+					v = []digest.Digest{d}
+				case assoc.ExecInspect, assoc.Logs, assoc.Bundle:
+					l := dbval.L
+					for _, val := range l {
+						d, err := reflow.Digester.Parse(*val.S)
+						if err != nil {
+							continue
+						}
+						v = append(v, d)
+					}
+					if v == nil {
+						log.Errorf("no valid digests of kind %v for dynamodb entry %v", kind, item)
+						continue
+					}
+				}
+				mappingHandler.HandleMapping(k, v, kind, time.Unix(itemAccessTime, 0), labels)
+			}
 		}
 		return nil
 	}))

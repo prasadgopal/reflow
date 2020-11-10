@@ -58,10 +58,10 @@ func Force(v values.T, t *types.T) values.T {
 		return r.Resolve(nil)
 	case types.MapKind:
 		var (
-			m    = v.(values.Map)
-			copy = make(values.Map)
+			m    = v.(*values.Map)
+			copy = new(values.Map)
 			r    = newResolver(copy, t)
-			kvs  = make([]kpvp, 0, len(m))
+			kvs  = make([]kpvp, 0, m.Len())
 		)
 		m.Each(func(k, v values.T) {
 			kk := Force(k, t.Index)
@@ -100,7 +100,7 @@ func Force(v values.T, t *types.T) values.T {
 			r    = newResolver(copy, t)
 			kvs  []kvp
 		)
-		for k := range s {
+		for k := range fm {
 			vv := Force(s[k], fm[k])
 			copy[k] = vv
 			kv := kvp{k, &vv}
@@ -120,7 +120,7 @@ func Force(v values.T, t *types.T) values.T {
 			fm   = t.FieldMap()
 			kvs  []kvp
 		)
-		for k := range m {
+		for k := range fm {
 			vv := Force(m[k], fm[k])
 			copy[k] = vv
 			kv := kvp{k, &vv}
@@ -132,6 +132,22 @@ func Force(v values.T, t *types.T) values.T {
 				copy[kv.K.(string)] = *kv.V
 			}
 		})
+	case types.SumKind:
+		var (
+			variant = v.(*values.Variant)
+			elemTyp = t.VariantMap()[variant.Tag]
+		)
+		if elemTyp == nil {
+			// It is a variant with no element, so there is nothing to resolve.
+			return v
+		}
+		var (
+			copy = &values.Variant{Tag: variant.Tag}
+			r    = newResolver(copy, t)
+		)
+		copy.Elem = Force(variant.Elem, elemTyp)
+		r.Add(&copy.Elem, elemTyp)
+		return r.Resolve(nil)
 	}
 	panic("bad value")
 }

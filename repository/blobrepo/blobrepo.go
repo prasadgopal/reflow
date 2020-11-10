@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/url"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/grailbio/base/digest"
@@ -62,6 +63,20 @@ func (r *Repository) Stat(ctx context.Context, id digest.Digest) (reflow.File, e
 	return file, err
 }
 
+// Location returns the location of this object.
+func (r *Repository) Location(ctx context.Context, id digest.Digest) (string, error) {
+	id, err := r.resolve(ctx, id)
+	if err != nil {
+		return "", err
+	}
+	var src string
+	file, err := r.Bucket.File(ctx, path.Join(r.Prefix, objectsPath, id.String()))
+	if err == nil {
+		src = file.Source
+	}
+	return src, err
+}
+
 // Get retrieves an object from the repository.
 func (r *Repository) Get(ctx context.Context, id digest.Digest) (io.ReadCloser, error) {
 	id, err := r.resolve(ctx, id)
@@ -79,20 +94,20 @@ func (r *Repository) GetFile(ctx context.Context, id digest.Digest, w io.WriterA
 	if err != nil {
 		return 0, err
 	}
-	return r.Bucket.Download(ctx, path.Join(r.Prefix, objectsPath, id.String()), "", w)
+	return r.Bucket.Download(ctx, path.Join(r.Prefix, objectsPath, id.String()), "", 0, w)
 }
 
 // Put installs an object into the repository; its digest ID is returned.
 func (r *Repository) Put(ctx context.Context, body io.Reader) (digest.Digest, error) {
 	dw := reflow.Digester.NewWriter()
 	uploadKey := path.Join(r.Prefix, uploadsPath, newID())
-	err := r.Bucket.Put(ctx, uploadKey, io.TeeReader(body, dw))
+	err := r.Bucket.Put(ctx, uploadKey, 0, io.TeeReader(body, dw), "")
 	if err != nil {
 		return digest.Digest{}, err
 	}
 	defer r.Bucket.Delete(ctx, uploadKey)
 	id := dw.Digest()
-	return id, r.Bucket.Copy(ctx, uploadKey, path.Join(r.Prefix, objectsPath, id.String()))
+	return id, r.Bucket.Copy(ctx, uploadKey, path.Join(r.Prefix, objectsPath, id.String()), id.Hex())
 }
 
 // PutFile installs a file into the repository. PutFile uses the S3 upload manager
@@ -103,7 +118,7 @@ func (r *Repository) PutFile(ctx context.Context, file reflow.File, body io.Read
 		return nil
 	}
 	key := path.Join(r.Prefix, objectsPath, file.ID.String())
-	return r.Bucket.Put(ctx, key, body)
+	return r.Bucket.Put(ctx, key, file.Size, body, file.ID.Hex())
 }
 
 // WriteTo is unsupported by the blob repository.
@@ -175,7 +190,7 @@ func (r *Repository) delete(ctx context.Context, keys []string) error {
 // CollectWithThreshold removes from this repository any objects which are not in the
 // liveset and which have not been accessed more recently than the liveset's
 // threshold time
-func (r *Repository) CollectWithThreshold(ctx context.Context, live liveset.Liveset, threshold time.Time, dryRun bool) error {
+func (r *Repository) CollectWithThreshold(ctx context.Context, live liveset.Liveset, dead liveset.Liveset, threshold time.Time, dryRun bool) error {
 	var (
 		objectsCheckedCount int64
 		liveObjectsCount    int64
@@ -204,10 +219,9 @@ func (r *Repository) CollectWithThreshold(ctx context.Context, live liveset.Live
 			log.Errorf("invalid s3 entry %v (%s)", key, file)
 			continue
 		}
-
 		if live.Contains(digest) {
 			liveObjectsCount++
-		} else if file.LastModified.After(threshold) {
+		} else if !dead.Contains(digest) && file.LastModified.After(threshold) {
 			afterThresholdCount++
 		} else {
 			if !dryRun {
@@ -253,7 +267,11 @@ func (r *Repository) CollectWithThreshold(ctx context.Context, live liveset.Live
 //
 //	<type>://bucket/prefix
 func (r *Repository) URL() *url.URL {
-	u, err := url.Parse(r.Bucket.Location() + "/" + r.Prefix)
+	loc := r.Bucket.Location()
+	if !strings.HasSuffix(loc, "/") {
+		loc += "/"
+	}
+	u, err := url.Parse(loc + r.Prefix)
 	if err != nil {
 		panic(err)
 	}

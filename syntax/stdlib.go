@@ -19,9 +19,24 @@ import (
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/errors"
 	"github.com/grailbio/reflow/flow"
+	"github.com/grailbio/reflow/internal/scanner"
 	"github.com/grailbio/reflow/internal/walker"
 	"github.com/grailbio/reflow/types"
 	"github.com/grailbio/reflow/values"
+)
+
+// FuncMode represents the behavior mode for SystemFuncs.
+type FuncMode int
+
+const (
+	// ModeDefault functions are passed arguments that have been evaluated.
+	ModeDefault FuncMode = iota
+
+	// ModeForced functions are passed arguments that have been evaluated and forced.
+	ModeForced
+
+	// ModeDirect functions are passed arguments that have not been evaluated (i.e. may be *flow.Flow).
+	ModeDirect
 )
 
 // SystemFunc is a utility to define a reflow intrinsic.
@@ -30,20 +45,23 @@ type SystemFunc struct {
 	Id     string
 	Doc    string
 	Type   *types.T
-	Force  bool
+	Mode   FuncMode
 	Do     func(loc values.Location, args []values.T) (values.T, error)
 }
 
 // Apply applied the intrinsic with the given arguments.
 func (s SystemFunc) Apply(loc values.Location, args []values.T) (values.T, error) {
 	args = append([]values.T{}, args...)
+	if s.Mode == ModeDirect {
+		return s.Do(loc, args)
+	}
 	var (
 		deps  []*flow.Flow
 		depsi []int
 		dw    = reflow.Digester.NewWriter()
 	)
 	for i := range args {
-		if s.Force {
+		if s.Mode == ModeForced {
 			args[i] = Force(args[i], s.Type.Fields[i].T)
 		}
 		if f, ok := args[i].(*flow.Flow); ok {
@@ -87,7 +105,7 @@ func (s SystemFunc) Decl() *Decl {
 		Kind:    DeclAssign,
 		Comment: s.Doc,
 		Pat:     &Pat{Kind: PatIdent, Ident: s.Id},
-		Expr:    &Expr{Kind: ExprConst, Val: s, Type: s.Type},
+		Expr:    &Expr{Kind: ExprLit, Val: s, Type: s.Type},
 		Type:    s.Type,
 	}
 }
@@ -100,7 +118,7 @@ func Stdlib() (*types.Env, *values.Env) {
 		venv = values.NewEnv()
 	)
 	define := func(sym, doc string, t *types.T, v values.T) {
-		tenv.Bind(sym, t)
+		tenv.Bind(sym, t, scanner.Position{}, types.Never)
 		venv.Bind(sym, v)
 	}
 
@@ -118,7 +136,7 @@ func Stdlib() (*types.Env, *values.Env) {
 					// This is a (small) local file; we inline it as a literal.
 					b, err := ioutil.ReadFile(rawurl)
 					if err != nil {
-						return nil, err
+						return nil, fmt.Errorf("%v %v: %v", loc.Position, loc.Ident, err)
 					}
 					if len(b) > 200<<20 {
 						return nil, fmt.Errorf("file %s is too large (%dMB); local files may not exceed 200MB", rawurl, len(b)>>20)
@@ -193,7 +211,7 @@ func Stdlib() (*types.Env, *values.Env) {
 						paths = append(paths, w.Relpath())
 						b, err := ioutil.ReadFile(w.Path())
 						if err != nil {
-							return nil, err
+							return nil, fmt.Errorf("%v %v: %v", loc.Position, loc.Ident, err)
 						}
 						datas = append(datas, b)
 					}
@@ -216,9 +234,9 @@ func Stdlib() (*types.Env, *values.Env) {
 						Position:   loc.Position,
 						Ident:      loc.Ident,
 						K: func(vs []values.T) *flow.Flow {
-							dir := make(values.Dir)
+							var dir values.Dir
 							for i := range vs {
-								dir[paths[i]] = vs[i].(reflow.Fileset).Map["."]
+								dir.Set(paths[i], vs[i].(reflow.Fileset).Map["."])
 							}
 							return &flow.Flow{
 								Op:         flow.Val,
@@ -250,7 +268,7 @@ func Stdlib() (*types.Env, *values.Env) {
 	}
 	define("KiB", "one kibibyte", types.Int, big.NewInt(1<<10))
 	define("MiB", "one mebibyte", types.Int, big.NewInt(1<<20))
-	define("GiB", "one gigibyte", types.Int, big.NewInt(1<<30))
+	define("GiB", "one gibibyte", types.Int, big.NewInt(1<<30))
 	define("TiB", "one tebibyte", types.Int, big.NewInt(1<<40))
 
 	return tenv, venv
@@ -277,7 +295,7 @@ var testDecls = []*Decl{
 		Module: "test",
 		Doc:    "Assert fails if any passed (boolean) value is false.",
 		Type:   types.Func(types.Unit, &types.Field{Name: "tests", T: types.List(types.Bool)}),
-		Force:  true,
+		Mode:   ModeForced,
 		Do: func(loc values.Location, args []values.T) (values.T, error) {
 			list := args[0].(values.List)
 			var failed []int
@@ -287,9 +305,30 @@ var testDecls = []*Decl{
 				}
 			}
 			if len(failed) > 0 {
-				return nil, fmt.Errorf("failed assertions: %v", failed)
+				return nil, fmt.Errorf("%v failed assertion %s%v", loc.Position, loc.Ident, failed)
 			}
 			return values.Unit, nil
+		},
+	}.Decl(),
+	SystemFunc{
+		Id:     "AssertMap",
+		Module: "test",
+		Doc:    "AssertMap fails if any keys of the passed map[string:bool] are false, with an error containing the list of failing keys.",
+		Type:   types.Func(types.Bool, &types.Field{Name: "tests", T: types.Map(types.String, types.Bool)}),
+		Mode:   ModeForced,
+		Do: func(loc values.Location, args []values.T) (values.T, error) {
+			m := args[0].(*values.Map)
+			failed := make([]string, 0, m.Len())
+			m.Each(func(k, v values.T) {
+				if !v.(bool) {
+					failed = append(failed, k.(string))
+				}
+			})
+			if len(failed) > 0 {
+				sort.Strings(failed)
+				return false, fmt.Errorf("%v failed assertion %s[%s]", loc.Position, loc.Ident, strings.Join(failed, ", "))
+			}
+			return true, nil
 		},
 	}.Decl(),
 	SystemFunc{
@@ -297,15 +336,39 @@ var testDecls = []*Decl{
 		Module: "test",
 		Doc:    "All returns true if every passed (boolean) value is true.",
 		Type:   types.Func(types.Bool, &types.Field{Name: "tests", T: types.List(types.Bool)}),
-		Force:  true,
+		Mode:   ModeForced,
 		Do: func(loc values.Location, args []values.T) (values.T, error) {
 			list := args[0].(values.List)
 			for i := range list {
 				if !list[i].(bool) {
-					return false, nil
+					return false, fmt.Errorf("%v failed assertion %s[%d]", loc.Position, loc.Ident, i)
 				}
 			}
 			return true, nil
+		},
+	}.Decl(),
+	SystemFunc{
+		Id:     "ExecRepeatAndCheck",
+		Module: "test",
+		Doc: "ExecRepeatAndCheck returns a boolean value denoting whether identical results were produced after" +
+			" repeating (the given number of times) each exec in the DAG implied by the given value.",
+		Type: types.Flow(types.Func(
+			types.Flow(types.Bool),
+			&types.Field{Name: "value", T: types.Flow(types.Top)},
+			&types.Field{Name: "times", T: types.Int}),
+		),
+		Mode: ModeDirect,
+		Do: func(loc values.Location, args []values.T) (values.T, error) {
+			f, ok := args[0].(*flow.Flow)
+			if !ok {
+				return nil, errors.E(loc.Position, loc.Ident, errNoExecsToRepeat)
+			}
+			bi := args[1].(*big.Int)
+			f, err := repeatExecs(f, int(bi.Int64()))
+			if err != nil {
+				return nil, errors.E(loc.Position, loc.Ident, err)
+			}
+			return f, nil
 		},
 	}.Decl(),
 }
@@ -314,9 +377,9 @@ var coerceFilesetToDirDigest = reflow.Digester.FromString("grail.com/reflow/synt
 
 func coerceFilesetToDir(v values.T) (values.T, error) {
 	fs := v.(reflow.Fileset)
-	dir := make(values.Dir)
+	var dir values.Dir
 	for key, file := range fs.Map {
-		dir[key] = file
+		dir.Set(key, file)
 	}
 	return dir, nil
 }
@@ -339,19 +402,16 @@ var dirsDecls = []*Decl{
 				return nil, err
 			}
 			groups := map[string]values.Dir{}
-			for path, file := range dir {
-				idx := re.FindStringSubmatch(path)
+			for scan := dir.Scan(); scan.Scan(); {
+				idx := re.FindStringSubmatch(scan.Path())
 				if len(idx) != 2 {
 					continue
 				}
-				v, ok := groups[idx[1]]
-				if !ok {
-					groups[idx[1]] = make(values.Dir)
-					v = groups[idx[1]]
-				}
-				v[path] = file
+				v := groups[idx[1]]
+				v.Set(scan.Path(), scan.File())
+				groups[idx[1]] = v
 			}
-			m := make(values.Map)
+			m := new(values.Map)
 			for key, group := range groups {
 				m.Insert(values.Digest(key, types.String), key, group)
 			}
@@ -361,15 +421,15 @@ var dirsDecls = []*Decl{
 	SystemFunc{
 		Id:     "Make",
 		Module: "dirs",
-		Force:  true,
+		Mode:   ModeForced,
 		Doc:    "Make creates a new dir using the given map of paths to files.",
 		Type: types.Func(types.Dir,
 			&types.Field{Name: "map", T: types.Map(types.String, types.File)}),
 		Do: func(loc values.Location, args []values.T) (values.T, error) {
-			m := args[0].(values.Map)
-			dir := make(values.Dir)
+			m := args[0].(*values.Map)
+			var dir values.Dir
 			m.Each(func(path, file values.T) {
-				dir[path.(string)] = file.(reflow.File)
+				dir.Set(path.(string), file.(reflow.File))
 			})
 			return dir, nil
 		},
@@ -384,13 +444,14 @@ var dirsDecls = []*Decl{
 			&types.Field{Name: "pattern", T: types.String}),
 		Do: func(loc values.Location, args []values.T) (values.T, error) {
 			dir, pat := args[0].(values.Dir), args[1].(string)
-			for key, file := range dir {
-				ok, err := path.Match(pat, key)
+			for scan := dir.Scan(); scan.Scan(); {
+
+				ok, err := path.Match(pat, scan.Path())
 				if err != nil {
 					return nil, err
 				}
 				if ok {
-					return values.Tuple{file, key}, nil
+					return values.Tuple{scan.File(), scan.Path()}, nil
 				}
 			}
 			return nil, errors.Errorf("dirs.Pick: no files matched %s", pat)
@@ -404,14 +465,9 @@ var dirsDecls = []*Decl{
 			&types.Field{Name: "dir", T: types.Dir}),
 		Do: func(loc values.Location, args []values.T) (values.T, error) {
 			dir := args[0].(values.Dir)
-			var keys []string
-			for key := range dir {
-				keys = append(keys, key)
-			}
-			sort.Strings(keys)
-			files := make(values.List, len(keys))
-			for i, key := range keys {
-				files[i] = dir[key]
+			files := make(values.List, 0, dir.Len())
+			for scan := dir.Scan(); scan.Scan(); {
+				files = append(files, scan.File())
 			}
 			return files, nil
 		},
@@ -600,7 +656,7 @@ var stringsDecls = []*Decl{
 	SystemFunc{
 		Id:     "Join",
 		Module: "strings",
-		Force:  true, // need full list
+		Mode:   ModeForced, // need full list
 		Doc:    "Join concatenates a list of strings into a single string using the provided separator.",
 		Type: types.Func(types.String,
 			&types.Field{Name: "strs", T: types.List(types.String)},
@@ -641,7 +697,7 @@ var stringsDecls = []*Decl{
 	SystemFunc{
 		Id:     "Sort",
 		Module: "strings",
-		Force:  true, // need full list
+		Mode:   ModeForced, // need full list
 		Doc:    "Sort sorts a list of strings in lexicographic order.",
 		Type: types.Func(types.List(types.String),
 			&types.Field{Name: "strs", T: types.List(types.String)}),
@@ -658,7 +714,7 @@ var stringsDecls = []*Decl{
 	SystemFunc{
 		Id:     "FromInt",
 		Module: "strings",
-		Force:  true,
+		Mode:   ModeForced,
 		Doc:    "FromInt parses an integer into a string.",
 		Type: types.Func(types.String,
 			&types.Field{Name: "intVal", T: types.Int}),
@@ -671,7 +727,7 @@ var stringsDecls = []*Decl{
 	SystemFunc{
 		Id:     "FromFloat",
 		Module: "strings",
-		Force:  true,
+		Mode:   ModeForced,
 		Doc:    "FromFloat parses a float into a string with the specified digits of precision.",
 		Type: types.Func(types.String,
 			&types.Field{Name: "floattVal", T: types.Float},
@@ -729,6 +785,7 @@ var pathDecls = []*Decl{
 		Doc: "Join joins a number of path elements into a single path. " +
 			"Empty elements are ignored, but the result is otherwise not cleaned " +
 			"and is thus compatible with URLs.",
+		Mode: ModeForced,
 		Type: types.Func(types.String,
 			&types.Field{Name: "paths", T: types.List(types.String)}),
 		Do: func(loc values.Location, args []values.T) (values.T, error) {

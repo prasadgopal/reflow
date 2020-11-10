@@ -8,6 +8,7 @@ import (
 	"context"
 	"flag"
 	"io"
+	"sort"
 
 	"github.com/grailbio/reflow/syntax"
 	"v.io/x/lib/textutil"
@@ -20,7 +21,9 @@ func (c *Cmd) doc(ctx context.Context, args ...string) {
 
 	if flags.NArg() == 0 {
 		c.Println("Reflow's system modules are:")
-		for _, name := range syntax.Modules() {
+		names := syntax.Modules()
+		sort.Strings(names)
+		for _, name := range names {
 			c.Printf("	$/%s\n", name)
 		}
 		return
@@ -30,9 +33,7 @@ func (c *Cmd) doc(ctx context.Context, args ...string) {
 	}
 	sess := syntax.NewSession(nil)
 	m, err := sess.Open(flags.Arg(0))
-	if err != nil {
-		c.Fatal(err)
-	}
+	c.must(err)
 	if params := m.Params(); len(params) > 0 {
 		c.Println("Parameters")
 		c.Println()
@@ -49,11 +50,11 @@ func (c *Cmd) doc(ctx context.Context, args ...string) {
 
 	c.Println("Declarations")
 	c.Println()
-	for _, f := range m.Type().Aliases {
+	for _, f := range m.Type(nil).Aliases {
 		c.Printf("type %s %s\n", f.Name, f.T)
 		c.printdoc(m.Doc(f.Name), "\n")
 	}
-	for _, f := range m.Type().Fields {
+	for _, f := range m.Type(nil).Fields {
 		c.Printf("val %s %s\n", f.Name, f.T)
 		c.printdoc(m.Doc(f.Name), "\n")
 	}

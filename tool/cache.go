@@ -25,10 +25,8 @@ Items are digests read from the standard input.`
 		flags.Usage()
 	}
 
-	ass, err := c.Config.Assoc()
-	if err != nil {
-		c.Fatal(err)
-	}
+	var ass assoc.Assoc
+	c.must(c.Config.Instance(&ass))
 
 	var n int
 	scan := bufio.NewScanner(os.Stdin)
@@ -39,7 +37,7 @@ Items are digests read from the standard input.`
 			continue
 		}
 		// TODO(marius): parallelize this for large jobs.
-		if err := assoc.Delete(ctx, ass, assoc.Fileset, id); err != nil {
+		if err := ass.Delete(ctx, id); err != nil {
 			c.Log.Errorf("failed to delete %s: %v", id, err)
 		}
 		c.Log.Debugf("removed key %v", id)

@@ -7,13 +7,15 @@ package tool
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 
+	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/grailbio/base/status"
+	"github.com/grailbio/infra/tls"
 	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/blob/s3blob"
 	"github.com/grailbio/reflow/ec2cluster"
+	"github.com/grailbio/reflow/log"
 	"github.com/grailbio/reflow/repository/blobrepo"
 	repositoryhttp "github.com/grailbio/reflow/repository/http"
 	"github.com/grailbio/reflow/runner"
@@ -35,27 +37,31 @@ type needer interface {
 // also ties the binary to specific implementations (e.g., s3), which
 // should be avoided.
 func (c *Cmd) Cluster(status *status.Group) runner.Cluster {
-	cluster, err := c.Config.Cluster()
+	var cluster runner.Cluster
+	err := c.Config.Instance(&cluster)
 	if err != nil {
 		c.Fatal(err)
 	}
-	if ec2cluster, ok := cluster.(*ec2cluster.Cluster); ok {
-		ec2cluster.Status = status
+	var ec *ec2cluster.Cluster
+	if err := c.Config.Instance(&ec); err == nil {
+		ec.Status = status
+		ec.Configuration = c.Config
+		if ierr := ec.VerifyAndInit(); ierr != nil {
+			c.Fatal(ierr)
+		}
 	} else {
-		log.Print("not a ec2cluster!")
+		log.Printf("not a ec2cluster! : %v", err)
 	}
-	sess, err := c.Config.AWS()
-	if err != nil {
-		c.Fatal(err)
-	}
-	clientConfig, _, err := c.Config.HTTPS()
+	var sess *session.Session
+	err = c.Config.Instance(&sess)
 	if err != nil {
 		c.Fatal(err)
 	}
 	blobrepo.Register("s3", s3blob.New(sess))
-	transport := &http.Transport{TLSClientConfig: clientConfig}
-	http2.ConfigureTransport(transport)
-	repositoryhttp.HTTPClient = &http.Client{Transport: transport}
+	repositoryhttp.HTTPClient, err = c.httpClient()
+	if err != nil {
+		c.Fatal(err)
+	}
 	if n, ok := cluster.(needer); ok {
 		http.HandleFunc("/clusterneed", func(w http.ResponseWriter, r *http.Request) {
 			if r.Method != "GET" {
@@ -71,4 +77,21 @@ func (c *Cmd) Cluster(status *status.Group) runner.Cluster {
 		})
 	}
 	return cluster
+}
+
+func (c *Cmd) httpClient() (*http.Client, error) {
+	var ca tls.Certs
+	err := c.Config.Instance(&ca)
+	if err != nil {
+		c.Fatal(err)
+	}
+	clientConfig, _, err := ca.HTTPS()
+	if err != nil {
+		c.Fatal(err)
+	}
+	transport := &http.Transport{TLSClientConfig: clientConfig}
+	if err := http2.ConfigureTransport(transport); err != nil {
+		c.Fatal(err)
+	}
+	return &http.Client{Transport: transport}, nil
 }

@@ -14,14 +14,15 @@ import (
 	"time"
 
 	"github.com/grailbio/base/digest"
+	"github.com/grailbio/infra"
 	"github.com/grailbio/reflow"
-	"github.com/grailbio/reflow/config"
 	"github.com/grailbio/reflow/errors"
 	"github.com/grailbio/reflow/log"
 	"github.com/grailbio/reflow/pool"
 	repositoryclient "github.com/grailbio/reflow/repository/client"
 	"github.com/grailbio/reflow/rest"
 	"golang.org/x/sync/singleflight"
+	"gopkg.in/yaml.v2"
 )
 
 // Client implements a reflow pool by dispatching calls to a remote
@@ -89,7 +90,7 @@ func (c *Client) Allocs(ctx context.Context) ([]pool.Alloc, error) {
 }
 
 // Config retrieves the reflowlet instance's reflow config.
-func (c *Client) Config(ctx context.Context) (config.Config, error) {
+func (c *Client) Config(ctx context.Context) (infra.Keys, error) {
 	call := c.Call("GET", "config")
 	defer call.Close()
 	code, err := call.Do(ctx, nil)
@@ -103,11 +104,59 @@ func (c *Client) Config(ctx context.Context) (config.Config, error) {
 	if err := call.Unmarshal(&cfgStr); err != nil {
 		return nil, errors.E("unmarshal config ", err)
 	}
-	cfg, err := config.Parse([]byte(cfgStr))
+	var keys infra.Keys
+	err = yaml.Unmarshal([]byte(cfgStr), &keys)
 	if err != nil {
 		return nil, errors.E("parse config", err)
 	}
-	return cfg, nil
+	return keys, nil
+}
+
+// ExecImage retrieves the reflowlet instance's executable image info.
+func (c *Client) ExecImage(ctx context.Context) (digest.Digest, error) {
+	var d digest.Digest
+	call := c.Call("GET", "execimage")
+	defer call.Close()
+	code, err := call.Do(ctx, nil)
+	if err != nil {
+		return d, errors.E("execimage", err)
+	}
+	if code != http.StatusOK {
+		return d, call.Error()
+	}
+	if err := call.Unmarshal(&d); err != nil {
+		return d, errors.E("unmarshall reflowlet execimage", err)
+	}
+	return d, nil
+}
+
+// InstallImage instructs the reflowlet instance to install and run a new image.
+// The image is referenced by the digest (in a format returned by digest.String())
+// and is expected to exist in the repository (or the call will fail).
+func (c *Client) InstallImage(ctx context.Context, d digest.Digest) error {
+	// install the image on the reflowlet and check if it worked
+	// by comparing the execimage digest again after waiting for some time
+	// (for the reflowlet to have restarted).
+	call := c.Call("POST", "execimage")
+	defer call.Close()
+	// Install the image onto the reflowlet. This will make the
+	// machine unresponsive, because it will not have a chance to reply
+	// to the exec call. We give it some time to recover.
+	ctx, cancel := context.WithTimeout(ctx, 1*time.Minute)
+	defer cancel()
+	// We expect an error since the reflowlet would've started the new image
+	// before it has a chance to reply.
+	// We check at least that the error comes from the right place in the stack
+	code, err := call.DoJSON(ctx, d)
+	if err != nil && !errors.Is(errors.Net, err) {
+		return fmt.Errorf("client.InstallImage: %v", err)
+	}
+	// If the call was successful and the image got 'exec'ed, we should get zero.
+	// Anything else should be treated as an error.
+	if code != 0 {
+		return call.Error()
+	}
+	return nil
 }
 
 type clientAlloc struct {
@@ -247,10 +296,15 @@ func (a *clientAlloc) Execs(ctx context.Context) ([]reflow.Exec, error) {
 	return execs, nil
 }
 
-func (a *clientAlloc) Load(ctx context.Context, fs reflow.Fileset) (reflow.Fileset, error) {
+// Load loads the fileset into the alloc repository.
+func (a *clientAlloc) Load(ctx context.Context, repo *url.URL, fs reflow.Fileset) (reflow.Fileset, error) {
 	call := a.Call("POST", "allocs/%s/load", a.id)
 	defer call.Close()
-	code, err := call.DoJSON(ctx, fs)
+	arg := struct {
+		Fileset reflow.Fileset
+		SrcUrl  *url.URL
+	}{fs, repo}
+	code, err := call.DoJSON(ctx, arg)
 	if err != nil {
 		return reflow.Fileset{}, errors.E("load", a.ID(), err)
 	}
@@ -260,6 +314,34 @@ func (a *clientAlloc) Load(ctx context.Context, fs reflow.Fileset) (reflow.Files
 	fs = reflow.Fileset{}
 	err = call.Unmarshal(&fs)
 	return fs, err
+}
+
+// VerifyIntegrity verifies the integrity of the given set of files
+func (a *clientAlloc) VerifyIntegrity(ctx context.Context, fs reflow.Fileset) error {
+	call := a.Call("POST", "allocs/%s/verify", a.id)
+	defer func() { _ = call.Close() }()
+	code, err := call.DoJSON(ctx, fs)
+	if err != nil {
+		return errors.E("verify", a.ID(), err)
+	}
+	if code != http.StatusOK {
+		return call.Error()
+	}
+	return nil
+}
+
+// Unload unloads the fileset from the alloc repository.
+func (a *clientAlloc) Unload(ctx context.Context, fs reflow.Fileset) error {
+	call := a.Call("POST", "allocs/%s/unload", a.id)
+	defer call.Close()
+	code, err := call.DoJSON(ctx, fs)
+	if err != nil {
+		return errors.E("unload", a.ID(), err)
+	}
+	if code != http.StatusOK {
+		return call.Error()
+	}
+	return nil
 }
 
 type clientExec struct {

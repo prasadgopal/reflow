@@ -5,24 +5,46 @@
 package syntax
 
 import (
+	"bytes"
 	"testing"
 
+	"github.com/grailbio/reflow"
 	"github.com/grailbio/reflow/flow"
+	"github.com/grailbio/reflow/values"
 )
 
 func TestDigestExec(t *testing.T) {
-	for _, expr := range []string{
-		`exec(image := "ubuntu") (out file) {" cp {{file("s3://blah")}} {{out}} "}`,
-		`exec(image := "ubuntu") (out file) {" cp {{    file("s3://blah")  }} {{  out}} "}`,
-		`exec(image := "ubuntu") (x file) {" cp {{file("s3://blah")}} {{x}} "}`,
-		`exec(image := "ubuntu", mem := 32*GiB) (x file) {" cp {{file("s3://blah")}} {{x}} "}`,
+	for _, expr := range []struct {
+		template string
+		kSha     string
+	}{
+		{
+			`exec(image := "ubuntu") (out file) {" cp {{file("s3://blah")}} {{out}} "}`,
+			"sha256:8452af59a381c85ee9f0e46d54f90ace40068b034a69d732967a1eb9cd7ed3b5"},
+		{
+			`exec(image := "ubuntu") (out file) {" cp {{    file("s3://blah")  }} {{  out}} "}`,
+			"sha256:217db429e085cd6cda825b6ef848491e26d28cc149fb1d522a6efc0f9039b701"},
+		{
+			`exec(image := "ubuntu") (x file) {" cp {{file("s3://blah")}} {{x}} "}`,
+			"sha256:983af1e08bc0f1f84afa8660440c15361009d6cc1b3f1dc2e2872f5a7a47474a"},
+		{
+			`exec(image := "ubuntu", mem := 32*GiB) (x file) {" cp {{file("s3://blah")}} {{x}} "}`,
+			"sha256:531ff51daa9804678e04b76e03bfc86d45a3028302574324e17e485144b5718a"},
 	} {
-		v, _, _, err := eval(expr)
+		v, _, _, err := eval(expr.template)
 		if err != nil {
 			t.Fatalf("%s: %v", expr, err)
 		}
 		f := v.(*flow.Flow)
-		if got, want := f.Digest().String(), "sha256:ceff79828962397af02d8e2ea30cf6388f2858e0deefbecaa73fad1c6fc88816"; got != want {
+		if got, want := f.Digest().String(), expr.kSha; got != want {
+			t.Errorf("got %v, want %v", got, want)
+		}
+		if got, want := f.Op, flow.K; got != want {
+			t.Errorf("got %v, want %v", got, want)
+		}
+		fd := reflow.File{ID: reflow.Digester.FromString("test")}
+		f = f.K([]values.T{fd})
+		if got, want := f.Digest().String(), "sha256:d8e460ec44666ed75cc4d41a46b961646e9c669266a2698cdb54f0323ebf7be4"; got != want {
 			t.Errorf("got %v, want %v", got, want)
 		}
 	}
@@ -55,6 +77,53 @@ func TestDigestCompr(t *testing.T) {
 		}
 		f := v.(*flow.Flow)
 		if got, want := f.Digest().String(), "sha256:8310ad9a33309b3b9b37c1bed2ec7898757cad3b3b5929aee538797bfee8fba0"; got != want {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	}
+}
+
+func TestDigestMap(t *testing.T) {
+	for _, expr := range []string{
+		`delay(["x": 1, "y": 4, "z": 100])`,
+		`delay(["y": 4, "z": 100, "x": 1])`,
+	} {
+		v, _, _, err := eval(expr)
+		if err != nil {
+			t.Fatalf("%s: %v", expr, err)
+		}
+		f := v.(*flow.Flow)
+		if got, want := f.Digest().String(), "sha256:f8a6305d5c748c774a08c8db12d02a322e64562f9c11b83a0ca59b5642fcf631"; got != want {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	}
+}
+
+func TestDigestVariant(t *testing.T) {
+	for _, c := range []struct {
+		expr   string
+		digest string
+	}{
+		{
+			`{x := 1; #Foo(x)}`,
+			"sha256:0661ccd5ff53d713ec0e11ce3abdcddf4e82c0545ccae3584fd96acd21d4b47b",
+		},
+		{
+			`{y := 1; #Foo(y)}`,
+			"sha256:0661ccd5ff53d713ec0e11ce3abdcddf4e82c0545ccae3584fd96acd21d4b47b",
+		},
+		{
+			`#Foo`,
+			"sha256:d53df340bde56133204297f48a5d54c8b2d76f971846784061d6f76ed9d6ae76",
+		},
+	} {
+		p := Parser{Body: bytes.NewReader([]byte(c.expr)), Mode: ParseExpr}
+		if err := p.Parse(); err != nil {
+			t.Fatalf("%s: %v", c.expr, err)
+		}
+		e := p.Expr
+		_, venv := Stdlib()
+		d := e.Digest(venv)
+		if got, want := d.String(), c.digest; got != want {
 			t.Errorf("got %v, want %v", got, want)
 		}
 	}

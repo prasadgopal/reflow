@@ -5,6 +5,8 @@
 package values
 
 import (
+	"fmt"
+
 	"github.com/grailbio/base/digest"
 	"github.com/grailbio/reflow/types"
 )
@@ -28,14 +30,32 @@ func NewEnv() *Env {
 
 // Bind binds the identifier id to value v.
 func (e *Env) Bind(id string, v T) {
+	if id == "" {
+		panic("empty identifier")
+	}
 	e.Symtab[id] = v
+}
+
+// String returns a string describing all the bindings in this
+// environment.
+func (e *Env) String() string {
+	tab := make(Symtab)
+	for ; e != nil; e = e.next {
+		for id, v := range e.Symtab {
+			_, ok := tab[id]
+			if !ok {
+				tab[id] = v
+			}
+		}
+	}
+	return fmt.Sprint(tab)
 }
 
 type digester interface {
 	Digest() digest.Digest
 }
 
-// Digest returns the digest for the value with idenfier id.
+// Digest returns the digest for the value with identifier id.
 // The supplied type is used to compute the digest. If the value
 // is a digest.Digest, it is returned directly; if implements the
 // interface
